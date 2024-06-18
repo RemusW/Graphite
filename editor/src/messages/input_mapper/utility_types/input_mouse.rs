@@ -1,12 +1,15 @@
+use crate::consts::DRAG_THRESHOLD;
+use crate::messages::prelude::*;
+
 use bitflags::bitflags;
 use glam::DVec2;
-use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 // Origin is top left
 pub type ViewportPosition = DVec2;
 pub type EditorPosition = DVec2;
 
-#[derive(PartialEq, Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(PartialEq, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ViewportBounds {
 	pub top_left: DVec2,
 	pub bottom_right: DVec2,
@@ -21,11 +24,11 @@ impl ViewportBounds {
 	}
 
 	pub fn size(&self) -> DVec2 {
-		self.bottom_right - self.top_left
+		(self.bottom_right - self.top_left).ceil()
 	}
 
 	pub fn center(&self) -> DVec2 {
-		self.bottom_right.lerp(self.top_left, 0.5)
+		(self.bottom_right - self.top_left).ceil() / 2.
 	}
 
 	pub fn in_bounds(&self, position: ViewportPosition) -> bool {
@@ -33,16 +36,35 @@ impl ViewportBounds {
 	}
 }
 
-#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+use std::hash::{Hash, Hasher};
+
+#[derive(Debug, Copy, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScrollDelta {
-	// TODO: Switch these to `f64` values (not trivial because floats don't provide PartialEq, Eq, and Hash)
-	pub x: i32,
-	pub y: i32,
-	pub z: i32,
+	pub x: f64,
+	pub y: f64,
+	pub z: f64,
+}
+
+impl PartialEq for ScrollDelta {
+	fn eq(&self, other: &Self) -> bool {
+		self.x == other.x && self.y == other.y && self.z == other.z
+	}
+}
+
+impl Eq for ScrollDelta {}
+
+impl Hash for ScrollDelta {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		let no_negative_zero = |value: f64| if value == 0. { 0. } else { value };
+
+		no_negative_zero(self.x).to_bits().hash(state);
+		no_negative_zero(self.y).to_bits().hash(state);
+		no_negative_zero(self.z).to_bits().hash(state);
+	}
 }
 
 impl ScrollDelta {
-	pub fn new(x: i32, y: i32, z: i32) -> Self {
+	pub fn new(x: f64, y: f64, z: f64) -> Self {
 		Self { x, y, z }
 	}
 
@@ -52,11 +74,12 @@ impl ScrollDelta {
 
 	pub fn scroll_delta(&self) -> f64 {
 		let (dx, dy) = (self.x, self.y);
-		dy.signum() as f64 * ((dy * dy + i32::min(dy.abs(), dx.abs()).pow(2)) as f64).sqrt()
+		dy.signum() as f64 * ((dy * dy + f64::min(dy.abs(), dx.abs()).powi(2)) as f64).sqrt()
 	}
 }
 
-#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
+// TODO: Document the difference between this and EditorMouseState
+#[derive(Debug, Copy, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MouseState {
 	pub position: ViewportPosition,
 	pub mouse_keys: MouseKeys,
@@ -64,30 +87,16 @@ pub struct MouseState {
 }
 
 impl MouseState {
-	pub fn new() -> Self {
-		Self::default()
-	}
-
-	pub fn from_position(x: f64, y: f64) -> Self {
-		Self {
-			position: (x, y).into(),
-			mouse_keys: MouseKeys::default(),
-			scroll_delta: ScrollDelta::default(),
-		}
-	}
-
-	pub fn from_keys_and_editor_position(keys: u8, position: ViewportPosition) -> Self {
-		let mouse_keys = MouseKeys::from_bits(keys).expect("Invalid modifier keys");
-
-		Self {
-			position,
-			mouse_keys,
-			scroll_delta: ScrollDelta::default(),
+	pub fn finish_transaction(&self, drag_start: DVec2, responses: &mut VecDeque<Message>) {
+		match drag_start.distance(self.position) <= DRAG_THRESHOLD {
+			true => responses.add(DocumentMessage::AbortTransaction),
+			false => responses.add(DocumentMessage::CommitTransaction),
 		}
 	}
 }
 
-#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
+// TODO: Document the difference between this and MouseState
+#[derive(Debug, Copy, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EditorMouseState {
 	pub editor_position: EditorPosition,
 	pub mouse_keys: MouseKeys,
@@ -95,20 +104,8 @@ pub struct EditorMouseState {
 }
 
 impl EditorMouseState {
-	pub fn new() -> Self {
-		Self::default()
-	}
-
-	pub fn from_editor_position(x: f64, y: f64) -> Self {
-		Self {
-			editor_position: (x, y).into(),
-			mouse_keys: MouseKeys::default(),
-			scroll_delta: ScrollDelta::default(),
-		}
-	}
-
 	pub fn from_keys_and_editor_position(keys: u8, editor_position: EditorPosition) -> Self {
-		let mouse_keys = MouseKeys::from_bits(keys).expect("Invalid modifier keys");
+		let mouse_keys = MouseKeys::from_bits(keys).expect("Invalid decoding of MouseKeys");
 
 		Self {
 			editor_position,
@@ -127,12 +124,26 @@ impl EditorMouseState {
 }
 
 bitflags! {
-	#[derive(Default, Serialize, Deserialize)]
+	/// Based on <https://developer.mozilla.org/en-US/docs/Web/API/MouseEvent/buttons#value>.
+	#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 	#[repr(transparent)]
 	pub struct MouseKeys: u8 {
-		const LEFT   = 0b0000_0001;
-		const RIGHT  = 0b0000_0010;
-		const MIDDLE = 0b0000_0100;
-		const NONE   = 0b0000_0000;
+		const NONE    = 0b0000_0000;
+		const LEFT    = 0b0000_0001;
+		const RIGHT   = 0b0000_0010;
+		const MIDDLE  = 0b0000_0100;
+		const BACK    = 0b0000_1000;
+		const FORWARD = 0b0001_0000;
 	}
 }
+
+#[impl_message(Message, InputMapperMessage, DoubleClick)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, specta::Type, num_enum::TryFromPrimitive)]
+#[repr(u8)]
+pub enum MouseButton {
+	Left,
+	Right,
+	Middle,
+}
+
+pub const NUMBER_OF_MOUSE_BUTTONS: usize = 3;

@@ -1,56 +1,37 @@
 use crate::messages::input_mapper::utility_types::input_keyboard::{Key, KeyStates, ModifierKeys};
-use crate::messages::input_mapper::utility_types::input_mouse::{MouseKeys, MouseState, ViewportBounds};
+use crate::messages::input_mapper::utility_types::input_mouse::{MouseButton, MouseKeys, MouseState, ViewportBounds};
+use crate::messages::input_mapper::utility_types::misc::FrameTimeInfo;
 use crate::messages::portfolio::utility_types::KeyboardPlatformLayout;
 use crate::messages::prelude::*;
 
-pub use graphene::DocumentResponse;
-
 use glam::DVec2;
+
+pub struct InputPreprocessorMessageData {
+	pub keyboard_platform: KeyboardPlatformLayout,
+}
 
 #[derive(Debug, Default)]
 pub struct InputPreprocessorMessageHandler {
+	pub frame_time: FrameTimeInfo,
 	pub keyboard: KeyStates,
 	pub mouse: MouseState,
 	pub viewport_bounds: ViewportBounds,
 }
 
-impl MessageHandler<InputPreprocessorMessage, KeyboardPlatformLayout> for InputPreprocessorMessageHandler {
-	#[remain::check]
-	fn process_message(&mut self, message: InputPreprocessorMessage, data: KeyboardPlatformLayout, responses: &mut VecDeque<Message>) {
-		let keyboard_platform = data;
+impl MessageHandler<InputPreprocessorMessage, InputPreprocessorMessageData> for InputPreprocessorMessageHandler {
+	fn process_message(&mut self, message: InputPreprocessorMessage, responses: &mut VecDeque<Message>, data: InputPreprocessorMessageData) {
+		let InputPreprocessorMessageData { keyboard_platform } = data;
 
-		#[remain::sorted]
 		match message {
 			InputPreprocessorMessage::BoundsOfViewports { bounds_of_viewports } => {
 				assert_eq!(bounds_of_viewports.len(), 1, "Only one viewport is currently supported");
 
 				for bounds in bounds_of_viewports {
-					let new_size = bounds.size();
-					let existing_size = self.viewport_bounds.size();
-
-					let translation = (new_size - existing_size) / 2.;
-
 					// TODO: Extend this to multiple viewports instead of setting it to the value of this last loop iteration
 					self.viewport_bounds = bounds;
 
-					responses.push_back(
-						graphene::Operation::TransformLayer {
-							path: vec![],
-							transform: glam::DAffine2::from_translation(translation).to_cols_array(),
-						}
-						.into(),
-					);
-					responses.push_back(
-						DocumentMessage::Artboard(
-							graphene::Operation::TransformLayer {
-								path: vec![],
-								transform: glam::DAffine2::from_translation(translation).to_cols_array(),
-							}
-							.into(),
-						)
-						.into(),
-					);
-					responses.push_back(FrontendMessage::TriggerViewportResize.into());
+					responses.add(NavigationMessage::CanvasPan { delta: DVec2::ZERO });
+					responses.add(FrontendMessage::TriggerViewportResize);
 				}
 			}
 			InputPreprocessorMessage::DoubleClick { editor_mouse_state, modifier_keys } => {
@@ -59,17 +40,30 @@ impl MessageHandler<InputPreprocessorMessage, KeyboardPlatformLayout> for InputP
 				let mouse_state = editor_mouse_state.to_mouse_state(&self.viewport_bounds);
 				self.mouse.position = mouse_state.position;
 
-				responses.push_back(InputMapperMessage::DoubleClick.into());
+				for key in mouse_state.mouse_keys {
+					responses.add(InputMapperMessage::DoubleClick(match key {
+						MouseKeys::LEFT => MouseButton::Left,
+						MouseKeys::RIGHT => MouseButton::Right,
+						MouseKeys::MIDDLE => MouseButton::Middle,
+						_ => unimplemented!(),
+					}));
+				}
 			}
-			InputPreprocessorMessage::KeyDown { key, modifier_keys } => {
+			InputPreprocessorMessage::KeyDown { key, key_repeat, modifier_keys } => {
 				self.update_states_of_modifier_keys(modifier_keys, keyboard_platform, responses);
 				self.keyboard.set(key as usize);
-				responses.push_back(InputMapperMessage::KeyDown(key).into());
+				if !key_repeat {
+					responses.add(InputMapperMessage::KeyDownNoRepeat(key));
+				}
+				responses.add(InputMapperMessage::KeyDown(key));
 			}
-			InputPreprocessorMessage::KeyUp { key, modifier_keys } => {
+			InputPreprocessorMessage::KeyUp { key, key_repeat, modifier_keys } => {
 				self.update_states_of_modifier_keys(modifier_keys, keyboard_platform, responses);
 				self.keyboard.unset(key as usize);
-				responses.push_back(InputMapperMessage::KeyUp(key).into());
+				if !key_repeat {
+					responses.add(InputMapperMessage::KeyUpNoRepeat(key));
+				}
+				responses.add(InputMapperMessage::KeyUp(key));
 			}
 			InputPreprocessorMessage::PointerDown { editor_mouse_state, modifier_keys } => {
 				self.update_states_of_modifier_keys(modifier_keys, keyboard_platform, responses);
@@ -85,7 +79,7 @@ impl MessageHandler<InputPreprocessorMessage, KeyboardPlatformLayout> for InputP
 				let mouse_state = editor_mouse_state.to_mouse_state(&self.viewport_bounds);
 				self.mouse.position = mouse_state.position;
 
-				responses.push_back(InputMapperMessage::PointerMove.into());
+				responses.add(InputMapperMessage::PointerMove);
 
 				// While any pointer button is already down, additional button down events are not reported, but they are sent as `pointermove` events
 				self.translate_mouse_event(mouse_state, false, responses);
@@ -98,6 +92,9 @@ impl MessageHandler<InputPreprocessorMessage, KeyboardPlatformLayout> for InputP
 
 				self.translate_mouse_event(mouse_state, false, responses);
 			}
+			InputPreprocessorMessage::FrameTimeAdvance { timestamp } => {
+				self.frame_time.advance_timestamp(timestamp);
+			}
 			InputPreprocessorMessage::WheelScroll { editor_mouse_state, modifier_keys } => {
 				self.update_states_of_modifier_keys(modifier_keys, keyboard_platform, responses);
 
@@ -105,7 +102,7 @@ impl MessageHandler<InputPreprocessorMessage, KeyboardPlatformLayout> for InputP
 				self.mouse.position = mouse_state.position;
 				self.mouse.scroll_delta = mouse_state.scroll_delta;
 
-				responses.push_back(InputMapperMessage::WheelScroll.into());
+				responses.add(InputMapperMessage::WheelScroll);
 			}
 		};
 	}
@@ -123,15 +120,17 @@ impl InputPreprocessorMessageHandler {
 			let old_down = self.mouse.mouse_keys & bit_flag == bit_flag;
 			let new_down = new_state.mouse_keys & bit_flag == bit_flag;
 			if !old_down && new_down {
-				if allow_first_button_down || self.mouse.mouse_keys != MouseKeys::NONE {
-					responses.push_back(InputMapperMessage::KeyDown(key).into());
+				if allow_first_button_down || self.mouse.mouse_keys != MouseKeys::empty() {
+					self.keyboard.set(key as usize);
+					responses.add(InputMapperMessage::KeyDown(key));
 				} else {
 					// Required to stop a keyup being emitted for a keydown outside canvas
 					new_state.mouse_keys ^= bit_flag;
 				}
 			}
 			if old_down && !new_down {
-				responses.push_back(InputMapperMessage::KeyUp(key).into());
+				self.keyboard.unset(key as usize);
+				responses.add(InputMapperMessage::KeyUp(key));
 			}
 		}
 
@@ -166,10 +165,10 @@ impl InputPreprocessorMessageHandler {
 
 		if key_was_down && !key_is_down {
 			self.keyboard.unset(key as usize);
-			responses.push_back(InputMapperMessage::KeyUp(key).into());
+			responses.add(InputMapperMessage::KeyUp(key));
 		} else if !key_was_down && key_is_down {
 			self.keyboard.set(key as usize);
-			responses.push_back(InputMapperMessage::KeyDown(key).into());
+			responses.add(InputMapperMessage::KeyDown(key));
 		}
 	}
 
@@ -182,7 +181,7 @@ impl InputPreprocessorMessageHandler {
 #[cfg(test)]
 mod test {
 	use crate::messages::input_mapper::utility_types::input_keyboard::{Key, ModifierKeys};
-	use crate::messages::input_mapper::utility_types::input_mouse::EditorMouseState;
+	use crate::messages::input_mapper::utility_types::input_mouse::{EditorMouseState, MouseKeys, ScrollDelta};
 	use crate::messages::portfolio::utility_types::KeyboardPlatformLayout;
 	use crate::messages::prelude::*;
 
@@ -190,13 +189,20 @@ mod test {
 	fn process_action_mouse_move_handle_modifier_keys() {
 		let mut input_preprocessor = InputPreprocessorMessageHandler::default();
 
-		let editor_mouse_state = EditorMouseState::from_editor_position(4., 809.);
+		let editor_mouse_state = EditorMouseState {
+			editor_position: (4., 809.).into(),
+			mouse_keys: MouseKeys::default(),
+			scroll_delta: ScrollDelta::default(),
+		};
 		let modifier_keys = ModifierKeys::ALT;
 		let message = InputPreprocessorMessage::PointerMove { editor_mouse_state, modifier_keys };
 
 		let mut responses = VecDeque::new();
 
-		input_preprocessor.process_message(message, KeyboardPlatformLayout::Standard, &mut responses);
+		let data = InputPreprocessorMessageData {
+			keyboard_platform: KeyboardPlatformLayout::Standard,
+		};
+		input_preprocessor.process_message(message, &mut responses, data);
 
 		assert!(input_preprocessor.keyboard.get(Key::Alt as usize));
 		assert_eq!(responses.pop_front(), Some(InputMapperMessage::KeyDown(Key::Alt).into()));
@@ -206,13 +212,16 @@ mod test {
 	fn process_action_mouse_down_handle_modifier_keys() {
 		let mut input_preprocessor = InputPreprocessorMessageHandler::default();
 
-		let editor_mouse_state = EditorMouseState::new();
+		let editor_mouse_state = EditorMouseState::default();
 		let modifier_keys = ModifierKeys::CONTROL;
 		let message = InputPreprocessorMessage::PointerDown { editor_mouse_state, modifier_keys };
 
 		let mut responses = VecDeque::new();
 
-		input_preprocessor.process_message(message, KeyboardPlatformLayout::Standard, &mut responses);
+		let data = InputPreprocessorMessageData {
+			keyboard_platform: KeyboardPlatformLayout::Standard,
+		};
+		input_preprocessor.process_message(message, &mut responses, data);
 
 		assert!(input_preprocessor.keyboard.get(Key::Control as usize));
 		assert_eq!(responses.pop_front(), Some(InputMapperMessage::KeyDown(Key::Control).into()));
@@ -222,13 +231,16 @@ mod test {
 	fn process_action_mouse_up_handle_modifier_keys() {
 		let mut input_preprocessor = InputPreprocessorMessageHandler::default();
 
-		let editor_mouse_state = EditorMouseState::new();
+		let editor_mouse_state = EditorMouseState::default();
 		let modifier_keys = ModifierKeys::SHIFT;
 		let message = InputPreprocessorMessage::PointerUp { editor_mouse_state, modifier_keys };
 
 		let mut responses = VecDeque::new();
 
-		input_preprocessor.process_message(message, KeyboardPlatformLayout::Standard, &mut responses);
+		let data = InputPreprocessorMessageData {
+			keyboard_platform: KeyboardPlatformLayout::Standard,
+		};
+		input_preprocessor.process_message(message, &mut responses, data);
 
 		assert!(input_preprocessor.keyboard.get(Key::Shift as usize));
 		assert_eq!(responses.pop_front(), Some(InputMapperMessage::KeyDown(Key::Shift).into()));
@@ -240,12 +252,16 @@ mod test {
 		input_preprocessor.keyboard.set(Key::Control as usize);
 
 		let key = Key::KeyA;
+		let key_repeat = false;
 		let modifier_keys = ModifierKeys::empty();
-		let message = InputPreprocessorMessage::KeyDown { key, modifier_keys };
+		let message = InputPreprocessorMessage::KeyDown { key, key_repeat, modifier_keys };
 
 		let mut responses = VecDeque::new();
 
-		input_preprocessor.process_message(message, KeyboardPlatformLayout::Standard, &mut responses);
+		let data = InputPreprocessorMessageData {
+			keyboard_platform: KeyboardPlatformLayout::Standard,
+		};
+		input_preprocessor.process_message(message, &mut responses, data);
 
 		assert!(!input_preprocessor.keyboard.get(Key::Control as usize));
 		assert_eq!(responses.pop_front(), Some(InputMapperMessage::KeyUp(Key::Control).into()));
@@ -256,12 +272,16 @@ mod test {
 		let mut input_preprocessor = InputPreprocessorMessageHandler::default();
 
 		let key = Key::KeyS;
+		let key_repeat = false;
 		let modifier_keys = ModifierKeys::CONTROL | ModifierKeys::SHIFT;
-		let message = InputPreprocessorMessage::KeyUp { key, modifier_keys };
+		let message = InputPreprocessorMessage::KeyUp { key, key_repeat, modifier_keys };
 
 		let mut responses = VecDeque::new();
 
-		input_preprocessor.process_message(message, KeyboardPlatformLayout::Standard, &mut responses);
+		let data = InputPreprocessorMessageData {
+			keyboard_platform: KeyboardPlatformLayout::Standard,
+		};
+		input_preprocessor.process_message(message, &mut responses, data);
 
 		assert!(input_preprocessor.keyboard.get(Key::Control as usize));
 		assert!(input_preprocessor.keyboard.get(Key::Shift as usize));

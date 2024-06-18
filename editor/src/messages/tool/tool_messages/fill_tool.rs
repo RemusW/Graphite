@@ -1,35 +1,22 @@
-use crate::consts::SELECTION_TOLERANCE;
-use crate::messages::frontend::utility_types::MouseCursorIcon;
-use crate::messages::input_mapper::utility_types::input_keyboard::MouseMotion;
-use crate::messages::layout::utility_types::layout_widget::PropertyHolder;
-use crate::messages::prelude::*;
-use crate::messages::tool::utility_types::{EventToMessageMap, Fsm, ToolActionHandlerData, ToolMetadata, ToolTransition, ToolType};
-use crate::messages::tool::utility_types::{HintData, HintGroup, HintInfo};
+use super::tool_prelude::*;
 
-use graphene::intersection::Quad;
-use graphene::layers::style::Fill;
-use graphene::Operation;
-
-use glam::DVec2;
-use serde::{Deserialize, Serialize};
+use graphene_core::vector::style::Fill;
 
 #[derive(Default)]
 pub struct FillTool {
 	fsm_state: FillToolFsmState,
-	data: FillToolData,
 }
 
-#[remain::sorted]
 #[impl_message(Message, ToolMessage, Fill)]
-#[derive(PartialEq, Eq, Clone, Debug, Hash, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Debug, Hash, serde::Serialize, serde::Deserialize, specta::Type)]
 pub enum FillToolMessage {
 	// Standard messages
-	#[remain::unsorted]
 	Abort,
 
 	// Tool-specific messages
-	LeftPointerDown,
-	RightPointerDown,
+	PointerUp,
+	FillPrimaryColor,
+	FillSecondaryColor,
 }
 
 impl ToolMetadata for FillTool {
@@ -44,127 +31,100 @@ impl ToolMetadata for FillTool {
 	}
 }
 
-impl PropertyHolder for FillTool {}
+impl LayoutHolder for FillTool {
+	fn layout(&self) -> Layout {
+		Layout::WidgetLayout(WidgetLayout::default())
+	}
+}
 
-impl<'a> MessageHandler<ToolMessage, ToolActionHandlerData<'a>> for FillTool {
-	fn process_message(&mut self, message: ToolMessage, data: ToolActionHandlerData<'a>, responses: &mut VecDeque<Message>) {
-		if message == ToolMessage::UpdateHints {
-			self.fsm_state.update_hints(responses);
-			return;
-		}
-
-		if message == ToolMessage::UpdateCursor {
-			self.fsm_state.update_cursor(responses);
-			return;
-		}
-
-		let new_state = self.fsm_state.transition(message, &mut self.data, data, &(), responses);
-
-		if self.fsm_state != new_state {
-			self.fsm_state = new_state;
-			self.fsm_state.update_hints(responses);
-			self.fsm_state.update_cursor(responses);
+impl<'a> MessageHandler<ToolMessage, &mut ToolActionHandlerData<'a>> for FillTool {
+	fn process_message(&mut self, message: ToolMessage, responses: &mut VecDeque<Message>, tool_data: &mut ToolActionHandlerData<'a>) {
+		self.fsm_state.process_event(message, &mut (), tool_data, &(), responses, true);
+	}
+	fn actions(&self) -> ActionList {
+		match self.fsm_state {
+			FillToolFsmState::Ready => actions!(FillToolMessageDiscriminant;
+				FillPrimaryColor,
+				FillSecondaryColor,
+			),
+			FillToolFsmState::Filling => actions!(FillToolMessageDiscriminant;
+				PointerUp,
+				Abort,
+			),
 		}
 	}
-
-	advertise_actions!(FillToolMessageDiscriminant;
-		LeftPointerDown,
-		RightPointerDown,
-	);
 }
 
 impl ToolTransition for FillTool {
 	fn event_to_message_map(&self) -> EventToMessageMap {
 		EventToMessageMap {
-			document_dirty: None,
 			tool_abort: Some(FillToolMessage::Abort.into()),
-			selection_changed: None,
+			..Default::default()
 		}
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum FillToolFsmState {
+	#[default]
 	Ready,
+	// Implemented as a fake dragging state that can be used to abort unwanted fills
+	Filling,
 }
-
-impl Default for FillToolFsmState {
-	fn default() -> Self {
-		FillToolFsmState::Ready
-	}
-}
-
-#[derive(Clone, Debug, Default)]
-struct FillToolData {}
 
 impl Fsm for FillToolFsmState {
-	type ToolData = FillToolData;
+	type ToolData = ();
 	type ToolOptions = ();
 
-	fn transition(
-		self,
-		event: ToolMessage,
-		_tool_data: &mut Self::ToolData,
-		(document, _document_id, global_tool_data, input, font_cache): ToolActionHandlerData,
-		_tool_options: &Self::ToolOptions,
-		responses: &mut VecDeque<Message>,
-	) -> Self {
-		use FillToolFsmState::*;
-		use FillToolMessage::*;
+	fn transition(self, event: ToolMessage, _tool_data: &mut Self::ToolData, handler_data: &mut ToolActionHandlerData, _tool_options: &Self::ToolOptions, responses: &mut VecDeque<Message>) -> Self {
+		let ToolActionHandlerData {
+			document, global_tool_data, input, ..
+		} = handler_data;
 
-		if let ToolMessage::Fill(event) = event {
-			match (self, event) {
-				(Ready, lmb_or_rmb) if lmb_or_rmb == LeftPointerDown || lmb_or_rmb == RightPointerDown => {
-					let mouse_pos = input.mouse.position;
-					let tolerance = DVec2::splat(SELECTION_TOLERANCE);
-					let quad = Quad::from_box([mouse_pos - tolerance, mouse_pos + tolerance]);
+		let ToolMessage::Fill(event) = event else {
+			return self;
+		};
 
-					if let Some(path) = document.graphene_document.intersects_quad_root(quad, font_cache).last() {
-						let color = match lmb_or_rmb {
-							LeftPointerDown => global_tool_data.primary_color,
-							RightPointerDown => global_tool_data.secondary_color,
-							Abort => unreachable!(),
-						};
-						let fill = Fill::Solid(color);
+		match (self, event) {
+			(FillToolFsmState::Ready, color_event) => {
+				let Some(layer_identifier) = document.click(input.mouse.position, &document.network) else {
+					return self;
+				};
+				let fill = match color_event {
+					FillToolMessage::FillPrimaryColor => Fill::Solid(global_tool_data.primary_color),
+					FillToolMessage::FillSecondaryColor => Fill::Solid(global_tool_data.secondary_color),
+					_ => return self,
+				};
 
-						responses.push_back(DocumentMessage::StartTransaction.into());
-						responses.push_back(Operation::SetLayerFill { path: path.to_vec(), fill }.into());
-						responses.push_back(DocumentMessage::CommitTransaction.into());
-					}
+				responses.add(DocumentMessage::StartTransaction);
+				responses.add(GraphOperationMessage::FillSet { layer: layer_identifier, fill });
+				responses.add(DocumentMessage::CommitTransaction);
 
-					Ready
-				}
-				_ => self,
+				FillToolFsmState::Filling
 			}
-		} else {
-			self
+			(FillToolFsmState::Filling, FillToolMessage::PointerUp) => FillToolFsmState::Ready,
+			(FillToolFsmState::Filling, FillToolMessage::Abort) => {
+				responses.add(DocumentMessage::AbortTransaction);
+
+				FillToolFsmState::Ready
+			}
+			_ => self,
 		}
 	}
 
 	fn update_hints(&self, responses: &mut VecDeque<Message>) {
 		let hint_data = match self {
 			FillToolFsmState::Ready => HintData(vec![HintGroup(vec![
-				HintInfo {
-					key_groups: vec![],
-					key_groups_mac: None,
-					mouse: Some(MouseMotion::Lmb),
-					label: String::from("Fill with Primary"),
-					plus: false,
-				},
-				HintInfo {
-					key_groups: vec![],
-					key_groups_mac: None,
-					mouse: Some(MouseMotion::Rmb),
-					label: String::from("Fill with Secondary"),
-					plus: false,
-				},
+				HintInfo::mouse(MouseMotion::Lmb, "Fill with Primary"),
+				HintInfo::keys([Key::Shift], "Fill with Secondary").prepend_plus(),
 			])]),
+			FillToolFsmState::Filling => HintData(vec![HintGroup(vec![HintInfo::mouse(MouseMotion::Rmb, ""), HintInfo::keys([Key::Escape], "Cancel").prepend_slash()])]),
 		};
 
-		responses.push_back(FrontendMessage::UpdateInputHints { hint_data }.into());
+		responses.add(FrontendMessage::UpdateInputHints { hint_data });
 	}
 
 	fn update_cursor(&self, responses: &mut VecDeque<Message>) {
-		responses.push_back(FrontendMessage::UpdateMouseCursor { cursor: MouseCursorIcon::Default }.into());
+		responses.add(FrontendMessage::UpdateMouseCursor { cursor: MouseCursorIcon::Default });
 	}
 }

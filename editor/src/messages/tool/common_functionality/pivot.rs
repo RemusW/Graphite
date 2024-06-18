@@ -1,13 +1,11 @@
 //! Handler for the pivot overlay visible on the selected layer(s) whilst using the Select tool which controls the center of rotation/scale and origin of the layer.
 
-use crate::application::generate_uuid;
-use crate::consts::{COLOR_ACCENT, PIVOT_INNER, PIVOT_OUTER, PIVOT_OUTER_OUTLINE_THICKNESS};
-use crate::messages::layout::utility_types::widgets::assist_widgets::PivotPosition;
+use super::graph_modification_utils;
+use crate::consts::PIVOT_DIAMETER;
+use crate::messages::layout::utility_types::widget_prelude::*;
+use crate::messages::portfolio::document::overlays::utility_types::OverlayContext;
+use crate::messages::portfolio::document::utility_types::document_metadata::LayerNodeIdentifier;
 use crate::messages::prelude::*;
-
-use graphene::layers::style;
-use graphene::layers::text_layer::FontCache;
-use graphene::{LayerId, Operation};
 
 use glam::{DAffine2, DVec2};
 use std::collections::VecDeque;
@@ -20,8 +18,6 @@ pub struct Pivot {
 	transform_from_normalized: DAffine2,
 	/// The viewspace pivot position (if applicable)
 	pivot: Option<DVec2>,
-	/// A reference to the previous overlays so we can destroy them
-	pivot_overlay_circles: Option<[Vec<LayerId>; 2]>,
 	/// The old pivot position in the GUI, used to reduce refreshes of the document bar
 	old_pivot_position: PivotPosition,
 }
@@ -32,7 +28,6 @@ impl Default for Pivot {
 			normalized_pivot: DVec2::splat(0.5),
 			transform_from_normalized: Default::default(),
 			pivot: Default::default(),
-			pivot_overlay_circles: Default::default(),
 			old_pivot_position: PivotPosition::Center,
 		}
 	}
@@ -40,113 +35,56 @@ impl Default for Pivot {
 
 impl Pivot {
 	/// Calculates the transform that gets from normalized pivot to viewspace.
-	fn get_layer_pivot_transform(layer_path: &[LayerId], layer: &graphene::layers::layer_info::Layer, document: &DocumentMessageHandler, font_cache: &FontCache) -> DAffine2 {
-		let [mut min, max] = layer.aabb_for_transform(DAffine2::IDENTITY, font_cache).unwrap_or([DVec2::ZERO, DVec2::ONE]);
+	fn get_layer_pivot_transform(layer: LayerNodeIdentifier, document: &DocumentMessageHandler) -> DAffine2 {
+		let [min, max] = document.metadata().nonzero_bounding_box(layer);
 
-		// If the layer bounds are 0 in either axis then set them to one (to avoid div 0)
-		if (max.x - min.x) < f64::EPSILON * 1000. {
-			min.x = max.x - 1.;
-		}
-		if (max.y - min.y) < f64::EPSILON * 1000. {
-			min.y = max.y - 1.;
-		}
 		let bounds_transform = DAffine2::from_translation(min) * DAffine2::from_scale(max - min);
-		let layer_transform = document.graphene_document.multiply_transforms(layer_path).unwrap_or(DAffine2::IDENTITY);
+		let layer_transform = document.metadata().transform_to_viewport(layer);
 		layer_transform * bounds_transform
 	}
 
 	/// Recomputes the pivot position and transform.
-	fn recalculate_pivot(&mut self, document: &DocumentMessageHandler, font_cache: &FontCache) {
-		let mut layers = document.selected_visible_layers();
-		if let Some(first) = layers.next() {
-			// Add one because the first item is consumed above.
-			let selected_layers_count = layers.count() + 1;
-
-			// If just one layer is selected we can use its inner transform
-			if selected_layers_count == 1 {
-				if let Ok(layer) = document.graphene_document.layer(first) {
-					self.normalized_pivot = layer.pivot;
-					self.transform_from_normalized = Self::get_layer_pivot_transform(first, layer, document, font_cache);
-					self.pivot = Some(self.transform_from_normalized.transform_point2(layer.pivot));
-				}
-			} else {
-				// If more than one layer is selected we use the AABB with the mean of the pivots
-				let xy_summation = document
-					.selected_visible_layers()
-					.filter_map(|path| document.graphene_document.pivot(path, font_cache))
-					.reduce(|a, b| a + b)
-					.unwrap_or_default();
-
-				let pivot = xy_summation / selected_layers_count as f64;
-				self.pivot = Some(pivot);
-				let [min, max] = document.selected_visible_layers_bounding_box(font_cache).unwrap_or([DVec2::ZERO, DVec2::ONE]);
-				self.normalized_pivot = (pivot - min) / (max - min);
-
-				self.transform_from_normalized = DAffine2::from_translation(min) * DAffine2::from_scale(max - min);
-			}
-		} else {
+	fn recalculate_pivot(&mut self, document: &DocumentMessageHandler) {
+		let mut layers = document.selected_nodes.selected_visible_and_unlocked_layers(document.metadata());
+		let Some(first) = layers.next() else {
 			// If no layers are selected then we revert things back to default
 			self.normalized_pivot = DVec2::splat(0.5);
 			self.pivot = None;
-		}
-	}
-
-	pub fn clear_overlays(&mut self, responses: &mut VecDeque<Message>) {
-		if let Some(overlays) = self.pivot_overlay_circles.take() {
-			for path in overlays {
-				responses.push_back(DocumentMessage::Overlays(Operation::DeleteLayer { path }.into()).into());
-			}
-		}
-	}
-
-	fn redraw_pivot(&mut self, responses: &mut VecDeque<Message>) {
-		self.clear_overlays(responses);
-
-		let pivot = match self.pivot {
-			Some(pivot) => pivot,
-			None => return,
+			return;
 		};
 
-		let layer_paths = [vec![generate_uuid()], vec![generate_uuid()]];
-		responses.push_back(
-			DocumentMessage::Overlays(
-				Operation::AddEllipse {
-					path: layer_paths[0].clone(),
-					transform: DAffine2::IDENTITY.to_cols_array(),
-					style: style::PathStyle::new(Some(style::Stroke::new(COLOR_ACCENT, PIVOT_OUTER_OUTLINE_THICKNESS)), style::Fill::Solid(graphene::color::Color::WHITE)),
-					insert_index: -1,
-				}
-				.into(),
-			)
-			.into(),
-		);
-		responses.push_back(
-			DocumentMessage::Overlays(
-				Operation::AddEllipse {
-					path: layer_paths[1].clone(),
-					transform: DAffine2::IDENTITY.to_cols_array(),
-					style: style::PathStyle::new(None, style::Fill::Solid(COLOR_ACCENT)),
-					insert_index: -1,
-				}
-				.into(),
-			)
-			.into(),
-		);
+		// Add one because the first item is consumed above.
+		let selected_layers_count = layers.count() + 1;
 
-		self.pivot_overlay_circles = Some(layer_paths.clone());
-		let [outer, inner] = layer_paths;
+		// If just one layer is selected we can use its inner transform (as it accounts for rotation)
+		if selected_layers_count == 1 {
+			let normalized_pivot = graph_modification_utils::get_pivot(first, &document.network).unwrap_or(DVec2::splat(0.5));
+			self.normalized_pivot = normalized_pivot;
+			self.transform_from_normalized = Self::get_layer_pivot_transform(first, document);
+			self.pivot = Some(self.transform_from_normalized.transform_point2(normalized_pivot));
+		} else {
+			// If more than one layer is selected we use the AABB with the mean of the pivots
+			let xy_summation = document
+				.selected_nodes
+				.selected_visible_and_unlocked_layers(document.metadata())
+				.map(|layer| graph_modification_utils::get_viewport_pivot(layer, &document.network, &document.metadata))
+				.reduce(|a, b| a + b)
+				.unwrap_or_default();
 
-		let pivot_diameter_without_outline = PIVOT_OUTER - PIVOT_OUTER_OUTLINE_THICKNESS;
-		let transform = DAffine2::from_scale_angle_translation(DVec2::splat(pivot_diameter_without_outline), 0., pivot - DVec2::splat(pivot_diameter_without_outline / 2.)).to_cols_array();
-		responses.push_back(DocumentMessage::Overlays(Operation::TransformLayerInViewport { path: outer, transform }.into()).into());
+			let pivot = xy_summation / selected_layers_count as f64;
+			self.pivot = Some(pivot);
+			let [min, max] = document.selected_visible_and_unlock_layers_bounding_box_viewport().unwrap_or([DVec2::ZERO, DVec2::ONE]);
+			self.normalized_pivot = (pivot - min) / (max - min);
 
-		let transform = DAffine2::from_scale_angle_translation(DVec2::splat(PIVOT_INNER), 0., pivot - DVec2::splat(PIVOT_INNER / 2.)).to_cols_array();
-		responses.push_back(DocumentMessage::Overlays(Operation::TransformLayerInViewport { path: inner, transform }.into()).into());
+			self.transform_from_normalized = DAffine2::from_translation(min) * DAffine2::from_scale(max - min);
+		}
 	}
 
-	pub fn update_pivot(&mut self, document: &DocumentMessageHandler, font_cache: &FontCache, responses: &mut VecDeque<Message>) {
-		self.recalculate_pivot(document, font_cache);
-		self.redraw_pivot(responses);
+	pub fn update_pivot(&mut self, document: &DocumentMessageHandler, overlay_context: &mut OverlayContext) {
+		self.recalculate_pivot(document);
+		if let Some(pivot) = self.pivot {
+			overlay_context.pivot(pivot);
+		}
 	}
 
 	/// Answers if the pivot widget has changed (so we should refresh the tool bar at the top of the canvas).
@@ -162,27 +100,24 @@ impl Pivot {
 	}
 
 	/// Sets the viewport position of the pivot for all selected layers.
-	pub fn set_viewport_position(&self, position: DVec2, document: &DocumentMessageHandler, font_cache: &FontCache, responses: &mut VecDeque<Message>) {
-		for layer_path in document.selected_visible_layers() {
-			if let Ok(layer) = document.graphene_document.layer(layer_path) {
-				let transform = Self::get_layer_pivot_transform(layer_path, layer, document, font_cache);
-				let pivot = transform.inverse().transform_point2(position);
-				// Only update the pivot when computed position is finite. Infinite can happen when scale is 0.
-				if pivot.is_finite() {
-					let layer_path = layer_path.to_owned();
-					responses.push_back(Operation::SetPivot { layer_path, pivot: pivot.into() }.into());
-				}
+	pub fn set_viewport_position(&self, position: DVec2, document: &DocumentMessageHandler, responses: &mut VecDeque<Message>) {
+		for layer in document.selected_nodes.selected_visible_and_unlocked_layers(document.metadata()) {
+			let transform = Self::get_layer_pivot_transform(layer, document);
+			let pivot = transform.inverse().transform_point2(position);
+			// Only update the pivot when computed position is finite. Infinite can happen when scale is 0.
+			if pivot.is_finite() {
+				responses.add(GraphOperationMessage::TransformSetPivot { layer, pivot });
 			}
 		}
 	}
 
 	/// Set the pivot using the normalized transform that is set above.
-	pub fn set_normalized_position(&self, position: DVec2, document: &DocumentMessageHandler, font_cache: &FontCache, responses: &mut VecDeque<Message>) {
-		self.set_viewport_position(self.transform_from_normalized.transform_point2(position), document, font_cache, responses);
+	pub fn set_normalized_position(&self, position: DVec2, document: &DocumentMessageHandler, responses: &mut VecDeque<Message>) {
+		self.set_viewport_position(self.transform_from_normalized.transform_point2(position), document, responses);
 	}
 
 	/// Answers if the pointer is currently positioned over the pivot.
 	pub fn is_over(&self, mouse: DVec2) -> bool {
-		self.pivot.filter(|&pivot| mouse.distance_squared(pivot) < (PIVOT_OUTER / 2.).powi(2)).is_some()
+		self.pivot.filter(|&pivot| mouse.distance_squared(pivot) < (PIVOT_DIAMETER / 2.).powi(2)).is_some()
 	}
 }

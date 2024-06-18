@@ -1,15 +1,7 @@
 use crate::dispatcher::Dispatcher;
 use crate::messages::prelude::*;
 
-use rand_chacha::rand_core::{RngCore, SeedableRng};
-use rand_chacha::ChaCha20Rng;
-use spin::Mutex;
-use std::cell::Cell;
-
-static RNG: Mutex<Option<ChaCha20Rng>> = Mutex::new(None);
-thread_local! {
-	pub static UUID_SEED: Cell<Option<u64>> = Cell::new(None);
-}
+pub use graphene_core::uuid::*;
 
 // TODO: serialize with serde to save the current editor state
 pub struct Editor {
@@ -17,7 +9,7 @@ pub struct Editor {
 }
 
 impl Editor {
-	/// Construct a new editor instance.
+	/// Construct the editor.
 	/// Remember to provide a random seed with `editor::set_uuid_seed(seed)` before any editors can be used.
 	pub fn new() -> Self {
 		Self { dispatcher: Dispatcher::new() }
@@ -26,10 +18,11 @@ impl Editor {
 	pub fn handle_message<T: Into<Message>>(&mut self, message: T) -> Vec<FrontendMessage> {
 		self.dispatcher.handle_message(message);
 
-		let mut responses = Vec::new();
-		std::mem::swap(&mut responses, &mut self.dispatcher.responses);
+		std::mem::take(&mut self.dispatcher.responses)
+	}
 
-		responses
+	pub fn poll_node_graph_evaluation(&mut self, responses: &mut VecDeque<Message>) {
+		self.dispatcher.poll_node_graph_evaluation(responses);
 	}
 }
 
@@ -39,45 +32,69 @@ impl Default for Editor {
 	}
 }
 
-pub fn set_uuid_seed(random_seed: u64) {
-	UUID_SEED.with(|seed| seed.set(Some(random_seed)))
-}
-
-pub fn generate_uuid() -> u64 {
-	let mut lock = RNG.lock();
-	if lock.is_none() {
-		UUID_SEED.with(|seed| {
-			let random_seed = seed.get().expect("Random seed not set before editor was initialized");
-			*lock = Some(ChaCha20Rng::seed_from_u64(random_seed));
-		})
-	}
-	lock.as_mut().map(ChaCha20Rng::next_u64).unwrap()
-}
-
-pub fn release_series() -> String {
-	format!("Release Series: {}", env!("GRAPHITE_RELEASE_SERIES"))
-}
-
-pub fn commit_info() -> String {
-	format!("{}\n{}\n{}", commit_timestamp(), commit_hash(), commit_branch())
-}
+pub const GRAPHITE_RELEASE_SERIES: &str = env!("GRAPHITE_RELEASE_SERIES");
+pub const GRAPHITE_GIT_COMMIT_DATE: &str = env!("GRAPHITE_GIT_COMMIT_DATE");
+pub const GRAPHITE_GIT_COMMIT_HASH: &str = env!("GRAPHITE_GIT_COMMIT_HASH");
+pub const GRAPHITE_GIT_COMMIT_BRANCH: &str = env!("GRAPHITE_GIT_COMMIT_BRANCH");
 
 pub fn commit_info_localized(localized_commit_date: &str) -> String {
-	format!("{}\n{}\n{}", commit_timestamp_localized(localized_commit_date), commit_hash(), commit_branch())
+	format!(
+		"Release Series: {}\n\
+		Branch: {}\n\
+		Commit: {}\n\
+		{}",
+		GRAPHITE_RELEASE_SERIES,
+		GRAPHITE_GIT_COMMIT_BRANCH,
+		&GRAPHITE_GIT_COMMIT_HASH[..8],
+		localized_commit_date
+	)
 }
 
-pub fn commit_timestamp() -> String {
-	format!("Date: {}", env!("GRAPHITE_GIT_COMMIT_DATE"))
-}
+#[cfg(test)]
+mod test {
+	use crate::messages::input_mapper::utility_types::input_mouse::ViewportBounds;
+	use crate::messages::prelude::*;
 
-pub fn commit_timestamp_localized(localized_commit_date: &str) -> String {
-	format!("Date: {}", localized_commit_date)
-}
+	// TODO: Fix and reenable
+	#[ignore]
+	#[test]
+	fn debug_ub() {
+		use super::Message;
 
-pub fn commit_hash() -> String {
-	format!("Hash: {}", &env!("GRAPHITE_GIT_COMMIT_HASH")[..8])
-}
+		let mut editor = super::Editor::new();
+		let mut responses = Vec::new();
 
-pub fn commit_branch() -> String {
-	format!("Branch: {}", env!("GRAPHITE_GIT_COMMIT_BRANCH"))
+		let messages: Vec<Message> = vec![
+			Message::Init,
+			Message::Preferences(PreferencesMessage::Load {
+				preferences: r#"{ "imaginate_server_hostname": "http://localhost:7860/", "imaginate_refresh_frequency": 1, "zoom_with_scroll": false }"#.to_string(),
+			}),
+			PortfolioMessage::OpenDocumentFileWithId {
+				document_id: DocumentId(0),
+				document_name: "".into(),
+				document_is_auto_saved: true,
+				document_is_saved: true,
+				document_serialized_content: r#" [removed until test is reenabled] "#.into(),
+			}
+			.into(),
+			InputPreprocessorMessage::BoundsOfViewports {
+				bounds_of_viewports: vec![ViewportBounds::from_slice(&[0., 0., 1920., 1080.])],
+			}
+			.into(),
+		];
+
+		use futures::executor::block_on;
+		for message in messages {
+			block_on(crate::node_graph_executor::run_node_graph());
+			let mut res = VecDeque::new();
+			editor.poll_node_graph_evaluation(&mut res);
+
+			let res = editor.handle_message(message);
+			responses.push(res);
+		}
+		let responses = responses.pop().unwrap();
+		// let trigger_message = responses[responses.len() - 2].clone();
+
+		println!("responses: {responses:#?}");
+	}
 }

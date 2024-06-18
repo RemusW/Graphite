@@ -1,25 +1,38 @@
-//! This file is where functions are defined to be called directly from JS.
-//! It serves as a thin wrapper over the editor backend API that relies
-//! on the dispatcher messaging system and more complex Rust data types.
-
-use crate::helpers::{translate_key, Error};
-use crate::{EDITOR_HAS_CRASHED, EDITOR_INSTANCES, JS_EDITOR_HANDLES};
+#![allow(clippy::too_many_arguments)]
+//
+// This file is where functions are defined to be called directly from JS.
+// It serves as a thin wrapper over the editor backend API that relies
+// on the dispatcher messaging system and more complex Rust data types.
+//
+use crate::helpers::translate_key;
+use crate::{Error, EDITOR, EDITOR_HANDLE, EDITOR_HAS_CRASHED};
 
 use editor::application::generate_uuid;
 use editor::application::Editor;
-use editor::consts::{FILE_SAVE_SUFFIX, GRAPHITE_DOCUMENT_VERSION};
+use editor::consts::FILE_SAVE_SUFFIX;
 use editor::messages::input_mapper::utility_types::input_keyboard::ModifierKeys;
 use editor::messages::input_mapper::utility_types::input_mouse::{EditorMouseState, ScrollDelta, ViewportBounds};
-use editor::messages::portfolio::utility_types::{ImaginateServerStatus, Platform};
+use editor::messages::portfolio::document::utility_types::document_metadata::LayerNodeIdentifier;
+use editor::messages::portfolio::utility_types::Platform;
 use editor::messages::prelude::*;
-use graphene::color::Color;
-use graphene::layers::imaginate_layer::ImaginateStatus;
-use graphene::LayerId;
+use editor::messages::tool::tool_messages::tool_prelude::WidgetId;
+use graph_craft::document::NodeId;
+use graphene_core::raster::color::Color;
 
 use serde::Serialize;
 use serde_wasm_bindgen::{self, from_value};
+use std::cell::RefCell;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use wasm_bindgen::prelude::*;
+
+/// We directly interface with the updateImage JS function for massively increased performance over serializing and deserializing.
+/// This avoids creating a json with a list millions of numbers long.
+// #[wasm_bindgen(module = "/../src/wasm-communication/editor.ts")]
+// extern "C" {
+// 	// fn dispatchTauri(message: String) -> String;
+// 	fn dispatchTauri(message: String);
+// }
 
 /// Set the random seed used by the editor by calling this from JS upon initialization.
 /// This is necessary because WASM doesn't have a random number generator.
@@ -28,41 +41,42 @@ pub fn set_random_seed(seed: u64) {
 	editor::application::set_uuid_seed(seed);
 }
 
-/// We directly interface with the updateImage JS function for massively increased performance over serializing and deserializing.
-/// This avoids creating a json with a list millions of numbers long.
-#[wasm_bindgen(module = "@/wasm-communication/editor")]
-extern "C" {
-	fn updateImage(path: Vec<u64>, mime: String, imageData: &[u8], document_id: u64);
-}
-
-/// Provides a handle to access the raw WASM memory
+/// Provides a handle to access the raw WASM memory.
 #[wasm_bindgen(js_name = wasmMemory)]
 pub fn wasm_memory() -> JsValue {
 	wasm_bindgen::memory()
 }
 
-// To avoid wasm-bindgen from checking mutable reference issues using WasmRefCell we must make all methods take a non mutable reference to self.
-// Not doing this creates an issue when rust calls into JS which calls back to rust in the same call stack.
+// ============================================================================
+
+/// This struct is, via wasm-bindgen, used by JS to interact with the editor backend. It does this by calling functions, which are `impl`ed
 #[wasm_bindgen]
 #[derive(Clone)]
-pub struct JsEditorHandle {
-	editor_id: u64,
+pub struct EditorHandle {
+	/// This callback is called by the editor's dispatcher when directing FrontendMessages from Rust to JS
 	frontend_message_handler_callback: js_sys::Function,
 }
 
+// Defined separately from the `impl` block below since this `impl` block lacks the `#[wasm_bindgen]` attribute.
+// Quirks in wasm-bindgen prevent functions in `#[wasm_bindgen]` `impl` blocks from being made publicly accessible from Rust.
+impl EditorHandle {
+	pub fn send_frontend_message_to_js_rust_proxy(&self, message: FrontendMessage) {
+		self.send_frontend_message_to_js(message);
+	}
+}
+
 #[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-impl JsEditorHandle {
+impl EditorHandle {
 	#[wasm_bindgen(constructor)]
 	pub fn new(frontend_message_handler_callback: js_sys::Function) -> Self {
-		let editor_id = generate_uuid();
 		let editor = Editor::new();
-		let editor_handle = JsEditorHandle {
-			editor_id,
-			frontend_message_handler_callback,
-		};
-		EDITOR_INSTANCES.with(|instances| instances.borrow_mut().insert(editor_id, editor));
-		JS_EDITOR_HANDLES.with(|instances| instances.borrow_mut().insert(editor_id, editor_handle.clone()));
+		let editor_handle = EditorHandle { frontend_message_handler_callback };
+		if EDITOR.with(|editor_cell| editor_cell.set(RefCell::new(editor))).is_err() {
+			log::error!("Attempted to initialize the editor more than once");
+		}
+		if EDITOR_HANDLE.with(|handle_cell| handle_cell.set(RefCell::new(editor_handle.clone()))).is_err() {
+			log::error!("Attempted to initialize the editor handle more than once");
+		}
 		editor_handle
 	}
 
@@ -73,36 +87,19 @@ impl JsEditorHandle {
 			return;
 		}
 
-		// Get the editor instances, dispatch the message, and store the `FrontendMessage` queue response
-		let frontend_messages = EDITOR_INSTANCES.with(|instances| {
-			// Mutably borrow the editors, and if successful, we can access them in the closure
-			instances.try_borrow_mut().map(|mut editors| {
-				// Get the editor instance for this editor ID, then dispatch the message to the backend, and return its response `FrontendMessage` queue
-				editors
-					.get_mut(&self.editor_id)
-					.expect("EDITOR_INSTANCES does not contain the current editor_id")
-					.handle_message(message.into())
-			})
-		});
+		// Get the editor, dispatch the message, and store the `FrontendMessage` queue response
+		let frontend_messages = editor(|editor| editor.handle_message(message.into()));
 
-		// Process any `FrontendMessage` responses resulting from the backend processing the dispatched message
-		if let Ok(frontend_messages) = frontend_messages {
-			// Send each `FrontendMessage` to the JavaScript frontend
-			for message in frontend_messages.into_iter() {
-				self.send_frontend_message_to_js(message);
-			}
+		// Send each `FrontendMessage` to the JavaScript frontend
+		for message in frontend_messages.into_iter() {
+			self.send_frontend_message_to_js(message);
 		}
-		// If the editor cannot be borrowed then it has encountered a panic - we should just ignore new dispatches
 	}
 
 	// Sends a FrontendMessage to JavaScript
-	fn send_frontend_message_to_js(&self, message: FrontendMessage) {
-		// Special case for update image data to avoid serialization times.
-		if let FrontendMessage::UpdateImageData { document_id, image_data } = message {
-			for image in image_data {
-				updateImage(image.path, image.mime, &image.image_data, document_id);
-			}
-			return;
+	fn send_frontend_message_to_js(&self, mut message: FrontendMessage) {
+		if let FrontendMessage::UpdateDocumentLayerStructure { data_buffer } = message {
+			message = FrontendMessage::UpdateDocumentLayerStructureJs { data_buffer: data_buffer.into() };
 		}
 
 		let message_type = message.to_discriminant().local_name();
@@ -128,16 +125,74 @@ impl JsEditorHandle {
 
 	#[wasm_bindgen(js_name = initAfterFrontendReady)]
 	pub fn init_after_frontend_ready(&self, platform: String) {
+		// Send initialization messages
 		let platform = match platform.as_str() {
 			"Windows" => Platform::Windows,
 			"Mac" => Platform::Mac,
 			"Linux" => Platform::Linux,
 			_ => Platform::Unknown,
 		};
-
 		self.dispatch(GlobalsMessage::SetPlatform { platform });
 		self.dispatch(Message::Init);
+
+		// Poll node graph evaluation on `requestAnimationFrame`
+		{
+			let f = std::rc::Rc::new(RefCell::new(None));
+			let g = f.clone();
+
+			*g.borrow_mut() = Some(Closure::new(move |timestamp| {
+				wasm_bindgen_futures::spawn_local(poll_node_graph_evaluation());
+
+				editor_and_handle(|editor, handle| {
+					let micros: f64 = timestamp * 1000.;
+					let timestamp = Duration::from_micros(micros.round() as u64);
+
+					for message in editor.handle_message(InputPreprocessorMessage::FrameTimeAdvance { timestamp }) {
+						handle.send_frontend_message_to_js(message);
+					}
+
+					for message in editor.handle_message(BroadcastMessage::TriggerEvent(BroadcastEvent::AnimationFrame)) {
+						handle.send_frontend_message_to_js(message);
+					}
+				});
+
+				// Schedule ourself for another requestAnimationFrame callback
+				request_animation_frame(f.borrow().as_ref().unwrap());
+			}));
+
+			request_animation_frame(g.borrow().as_ref().unwrap());
+		}
+
+		// Auto save all documents on `setTimeout`
+		{
+			let f = std::rc::Rc::new(RefCell::new(None));
+			let g = f.clone();
+
+			*g.borrow_mut() = Some(Closure::new(move || {
+				auto_save_all_documents();
+
+				// Schedule ourself for another setTimeout callback
+				set_timeout(f.borrow().as_ref().unwrap(), Duration::from_secs(editor::consts::AUTO_SAVE_TIMEOUT_SECONDS));
+			}));
+
+			set_timeout(g.borrow().as_ref().unwrap(), Duration::from_secs(editor::consts::AUTO_SAVE_TIMEOUT_SECONDS));
+		}
 	}
+
+	// #[wasm_bindgen(js_name = tauriResponse)]
+	// pub fn tauri_response(&self, _message: JsValue) {
+	// 	#[cfg(feature = "tauri")]
+	// 	match ron::from_str::<Vec<FrontendMessage>>(&_message.as_string().unwrap()) {
+	// 		Ok(response) => {
+	// 			for message in response {
+	// 				self.send_frontend_message_to_js(message);
+	// 			}
+	// 		}
+	// 		Err(error) => {
+	// 			log::error!("tauri response: {error:?}\n{_message:?}");
+	// 		}
+	// 	}
+	// }
 
 	/// Displays a dialog with an error message
 	#[wasm_bindgen(js_name = errorDialog)]
@@ -164,23 +219,40 @@ impl JsEditorHandle {
 		FILE_SAVE_SUFFIX.into()
 	}
 
-	/// Get the constant `GRAPHITE_DOCUMENT_VERSION`
-	#[wasm_bindgen(js_name = graphiteDocumentVersion)]
-	pub fn graphite_document_version(&self) -> String {
-		GRAPHITE_DOCUMENT_VERSION.to_string()
-	}
-
-	/// Update layout of a given UI
-	#[wasm_bindgen(js_name = updateLayout)]
-	pub fn update_layout(&self, layout_target: JsValue, widget_id: u64, value: JsValue) -> Result<(), JsValue> {
+	/// Update the value of a given UI widget, but don't commit it to the history (unless `commit_layout()` is called, which handles that)
+	#[wasm_bindgen(js_name = widgetValueUpdate)]
+	pub fn widget_value_update(&self, layout_target: JsValue, widget_id: u64, value: JsValue) -> Result<(), JsValue> {
+		let widget_id = WidgetId(widget_id);
 		match (from_value(layout_target), from_value(value)) {
 			(Ok(layout_target), Ok(value)) => {
-				let message = LayoutMessage::UpdateLayout { layout_target, widget_id, value };
+				let message = LayoutMessage::WidgetValueUpdate { layout_target, widget_id, value };
 				self.dispatch(message);
 				Ok(())
 			}
-			(target, val) => Err(Error::new(&format!("Could not update UI\nDetails:\nTarget: {:?}\nValue: {:?}", target, val)).into()),
+			(target, val) => Err(Error::new(&format!("Could not update UI\nDetails:\nTarget: {target:?}\nValue: {val:?}")).into()),
 		}
+	}
+
+	/// Commit the value of a given UI widget to the history
+	#[wasm_bindgen(js_name = widgetValueCommit)]
+	pub fn widget_value_commit(&self, layout_target: JsValue, widget_id: u64, value: JsValue) -> Result<(), JsValue> {
+		let widget_id = WidgetId(widget_id);
+		match (from_value(layout_target), from_value(value)) {
+			(Ok(layout_target), Ok(value)) => {
+				let message = LayoutMessage::WidgetValueCommit { layout_target, widget_id, value };
+				self.dispatch(message);
+				Ok(())
+			}
+			(target, val) => Err(Error::new(&format!("Could not commit UI\nDetails:\nTarget: {target:?}\nValue: {val:?}")).into()),
+		}
+	}
+
+	/// Update the value of a given UI widget, and commit it to the history
+	#[wasm_bindgen(js_name = widgetValueCommitAndUpdate)]
+	pub fn widget_value_commit_and_update(&self, layout_target: JsValue, widget_id: u64, value: JsValue) -> Result<(), JsValue> {
+		self.widget_value_commit(layout_target.clone(), widget_id, value.clone())?;
+		self.widget_value_update(layout_target, widget_id, value)?;
+		Ok(())
 	}
 
 	#[wasm_bindgen(js_name = loadPreferences)]
@@ -192,6 +264,7 @@ impl JsEditorHandle {
 
 	#[wasm_bindgen(js_name = selectDocument)]
 	pub fn select_document(&self, document_id: u64) {
+		let document_id = DocumentId(document_id);
 		let message = PortfolioMessage::SelectDocument { document_id };
 		self.dispatch(message);
 	}
@@ -202,9 +275,15 @@ impl JsEditorHandle {
 		self.dispatch(message);
 	}
 
-	#[wasm_bindgen(js_name = documentOpen)]
-	pub fn document_open(&self) {
+	#[wasm_bindgen(js_name = openDocument)]
+	pub fn open_document(&self) {
 		let message = PortfolioMessage::OpenDocument;
+		self.dispatch(message);
+	}
+
+	#[wasm_bindgen(js_name = demoArtworkDialog)]
+	pub fn demo_artwork_dialog(&self) {
+		let message = DialogMessage::RequestDemoArtworkDialog;
 		self.dispatch(message);
 	}
 
@@ -219,6 +298,7 @@ impl JsEditorHandle {
 
 	#[wasm_bindgen(js_name = openAutoSavedDocument)]
 	pub fn open_auto_saved_document(&self, document_id: u64, document_name: String, document_is_saved: bool, document_serialized_content: String) {
+		let document_id = DocumentId(document_id);
 		let message = PortfolioMessage::OpenDocumentFileWithId {
 			document_id,
 			document_name,
@@ -231,19 +311,24 @@ impl JsEditorHandle {
 
 	#[wasm_bindgen(js_name = triggerAutoSave)]
 	pub fn trigger_auto_save(&self, document_id: u64) {
+		let document_id = DocumentId(document_id);
 		let message = PortfolioMessage::AutoSaveDocument { document_id };
 		self.dispatch(message);
 	}
 
 	#[wasm_bindgen(js_name = closeDocumentWithConfirmation)]
 	pub fn close_document_with_confirmation(&self, document_id: u64) {
+		let document_id = DocumentId(document_id);
 		let message = PortfolioMessage::CloseDocumentWithConfirmation { document_id };
 		self.dispatch(message);
 	}
 
 	#[wasm_bindgen(js_name = requestAboutGraphiteDialogWithLocalizedCommitDate)]
-	pub fn request_about_graphite_dialog_with_localized_commit_date(&self, localized_commit_date: String) {
-		let message = DialogMessage::RequestAboutGraphiteDialogWithLocalizedCommitDate { localized_commit_date };
+	pub fn request_about_graphite_dialog_with_localized_commit_date(&self, localized_commit_date: String, localized_commit_year: String) {
+		let message = DialogMessage::RequestAboutGraphiteDialogWithLocalizedCommitDate {
+			localized_commit_date,
+			localized_commit_year,
+		};
 		self.dispatch(message);
 	}
 
@@ -270,7 +355,7 @@ impl JsEditorHandle {
 
 	/// Mouse scrolling within the screenspace bounds of the viewport
 	#[wasm_bindgen(js_name = onWheelScroll)]
-	pub fn on_wheel_scroll(&self, x: f64, y: f64, mouse_keys: u8, wheel_delta_x: i32, wheel_delta_y: i32, wheel_delta_z: i32, modifiers: u8) {
+	pub fn on_wheel_scroll(&self, x: f64, y: f64, mouse_keys: u8, wheel_delta_x: f64, wheel_delta_y: f64, wheel_delta_z: f64, modifiers: u8) {
 		let mut editor_mouse_state = EditorMouseState::from_keys_and_editor_position(mouse_keys, (x, y).into());
 		editor_mouse_state.scroll_delta = ScrollDelta::new(wheel_delta_x, wheel_delta_y, wheel_delta_z);
 
@@ -306,6 +391,7 @@ impl JsEditorHandle {
 	#[wasm_bindgen(js_name = onDoubleClick)]
 	pub fn on_double_click(&self, x: f64, y: f64, mouse_keys: u8, modifiers: u8) {
 		let editor_mouse_state = EditorMouseState::from_keys_and_editor_position(mouse_keys, (x, y).into());
+
 		let modifier_keys = ModifierKeys::from_bits(modifiers).expect("Invalid modifier keys");
 
 		let message = InputPreprocessorMessage::DoubleClick { editor_mouse_state, modifier_keys };
@@ -314,25 +400,25 @@ impl JsEditorHandle {
 
 	/// A keyboard button depressed within screenspace the bounds of the viewport
 	#[wasm_bindgen(js_name = onKeyDown)]
-	pub fn on_key_down(&self, name: String, modifiers: u8) {
+	pub fn on_key_down(&self, name: String, modifiers: u8, key_repeat: bool) {
 		let key = translate_key(&name);
 		let modifier_keys = ModifierKeys::from_bits(modifiers).expect("Invalid modifier keys");
 
-		trace!("Key down {:?}, name: {}, modifiers: {:?}", key, name, modifiers);
+		trace!("Key down {key:?}, name: {name}, modifiers: {modifiers:?}, key repeat: {key_repeat}");
 
-		let message = InputPreprocessorMessage::KeyDown { key, modifier_keys };
+		let message = InputPreprocessorMessage::KeyDown { key, key_repeat, modifier_keys };
 		self.dispatch(message);
 	}
 
 	/// A keyboard button released
 	#[wasm_bindgen(js_name = onKeyUp)]
-	pub fn on_key_up(&self, name: String, modifiers: u8) {
+	pub fn on_key_up(&self, name: String, modifiers: u8, key_repeat: bool) {
 		let key = translate_key(&name);
 		let modifier_keys = ModifierKeys::from_bits(modifiers).expect("Invalid modifier keys");
 
-		trace!("Key up {:?}, name: {}, modifiers: {:?}", key, name, modifier_keys);
+		trace!("Key up {key:?}, name: {name}, modifiers: {modifier_keys:?}, key repeat: {key_repeat}");
 
-		let message = InputPreprocessorMessage::KeyUp { key, modifier_keys };
+		let message = InputPreprocessorMessage::KeyUp { key, key_repeat, modifier_keys };
 		self.dispatch(message);
 	}
 
@@ -415,8 +501,9 @@ impl JsEditorHandle {
 
 	/// Modify the layer selection based on the layer which is clicked while holding down the <kbd>Ctrl</kbd> and/or <kbd>Shift</kbd> modifier keys used for range selection behavior
 	#[wasm_bindgen(js_name = selectLayer)]
-	pub fn select_layer(&self, layer_path: Vec<LayerId>, ctrl: bool, shift: bool) {
-		let message = DocumentMessage::SelectLayer { layer_path, ctrl, shift };
+	pub fn select_layer(&self, id: u64, ctrl: bool, shift: bool) {
+		let id = NodeId(id);
+		let message = DocumentMessage::SelectLayer { id, ctrl, shift };
 		self.dispatch(message);
 	}
 
@@ -427,184 +514,290 @@ impl JsEditorHandle {
 		self.dispatch(message);
 	}
 
-	/// Move a layer to be next to the specified neighbor
+	/// Move a layer to within a folder and placed down at the given index.
+	/// If the folder is `None`, it is inserted into the document root.
+	/// If the insert index is `None`, it is inserted at the end of the folder (equivalent to index infinity).
 	#[wasm_bindgen(js_name = moveLayerInTree)]
-	pub fn move_layer_in_tree(&self, folder_path: Vec<LayerId>, insert_index: isize) {
+	pub fn move_layer_in_tree(&self, insert_parent_id: Option<u64>, insert_index: Option<usize>) {
+		let insert_parent_id = insert_parent_id.map(NodeId);
+		let parent = insert_parent_id.map(LayerNodeIdentifier::new_unchecked).unwrap_or_default();
+
 		let message = DocumentMessage::MoveSelectedLayersTo {
-			folder_path,
-			insert_index,
-			reverse_index: true,
+			parent,
+			insert_index: insert_index.map(|x| x as isize).unwrap_or(-1),
 		};
 		self.dispatch(message);
 	}
 
 	/// Set the name for the layer
 	#[wasm_bindgen(js_name = setLayerName)]
-	pub fn set_layer_name(&self, layer_path: Vec<LayerId>, name: String) {
-		let message = DocumentMessage::SetLayerName { layer_path, name };
+	pub fn set_layer_name(&self, id: u64, name: String) {
+		let layer = LayerNodeIdentifier::new_unchecked(NodeId(id));
+		let message = GraphOperationMessage::SetName { layer, name };
 		self.dispatch(message);
 	}
 
 	/// Translates document (in viewport coords)
-	#[wasm_bindgen(js_name = translateCanvas)]
+	#[wasm_bindgen(js_name = panCanvas)]
 	pub fn translate_canvas(&self, delta_x: f64, delta_y: f64) {
-		let message = NavigationMessage::TranslateCanvas { delta: (delta_x, delta_y).into() };
+		let message = NavigationMessage::CanvasPan { delta: (delta_x, delta_y).into() };
 		self.dispatch(message);
 	}
 
 	/// Translates document (in viewport coords)
-	#[wasm_bindgen(js_name = translateCanvasByFraction)]
+	#[wasm_bindgen(js_name = panCanvasByFraction)]
 	pub fn translate_canvas_by_fraction(&self, delta_x: f64, delta_y: f64) {
-		let message = NavigationMessage::TranslateCanvasByViewportFraction { delta: (delta_x, delta_y).into() };
-		self.dispatch(message);
-	}
-
-	/// Sends the blob URL generated by JS to the Image layer
-	#[wasm_bindgen(js_name = setImageBlobURL)]
-	pub fn set_image_blob_url(&self, document_id: u64, layer_path: Vec<LayerId>, blob_url: String, width: f64, height: f64) {
-		let resolution = (width, height);
-		let message = PortfolioMessage::SetImageBlobUrl {
-			document_id,
-			layer_path,
-			blob_url,
-			resolution,
-		};
-		self.dispatch(message);
-	}
-
-	/// Sends the blob URL generated by JS to the Imaginate layer in the respective document
-	#[wasm_bindgen(js_name = setImaginateImageData)]
-	pub fn set_imaginate_image_data(&self, document_id: u64, layer_path: Vec<LayerId>, image_data: Vec<u8>) {
-		let message = PortfolioMessage::ImaginateSetImageData { document_id, layer_path, image_data };
-		self.dispatch(message);
-	}
-
-	/// Sends the blob URL generated by JS to the Imaginate layer in the respective document
-	#[wasm_bindgen(js_name = setImaginateBlobURL)]
-	pub fn set_imaginate_blob_url(&self, document_id: u64, layer_path: Vec<LayerId>, blob_url: String, width: f64, height: f64) {
-		let resolution = (width, height);
-		let message = PortfolioMessage::ImaginateSetBlobUrl {
-			document_id,
-			layer_path,
-			blob_url,
-			resolution,
-		};
-		self.dispatch(message);
-	}
-
-	/// Notifies the Imaginate layer of a new percentage of completion and whether or not it's currently generating
-	#[wasm_bindgen(js_name = setImaginateGeneratingStatus)]
-	pub fn set_imaginate_generating_status(&self, document_id: u64, path: Vec<LayerId>, percent: Option<f64>, status: String) {
-		let status = match status.as_str() {
-			"Idle" => ImaginateStatus::Idle,
-			"Beginning" => ImaginateStatus::Beginning,
-			"Uploading" => ImaginateStatus::Uploading(percent.expect("Percent needs to be supplied to set ImaginateStatus::Uploading")),
-			"Generating" => ImaginateStatus::Generating,
-			"Terminating" => ImaginateStatus::Terminating,
-			"Terminated" => ImaginateStatus::Terminated,
-			_ => panic!("Invalid string from JS for ImaginateStatus, received: {}", status),
-		};
-
-		let percent = if matches!(status, ImaginateStatus::Uploading(_)) { None } else { percent };
-
-		let message = PortfolioMessage::ImaginateSetGeneratingStatus { document_id, path, percent, status };
-		self.dispatch(message);
-	}
-
-	/// Notifies the editor that the Imaginate server is available or unavailable
-	#[wasm_bindgen(js_name = setImaginateServerStatus)]
-	pub fn set_imaginate_server_status(&self, available: bool) {
-		let message: Message = match available {
-			true => PortfolioMessage::ImaginateSetServerStatus {
-				status: ImaginateServerStatus::Connected,
-			}
-			.into(),
-			false => PortfolioMessage::ImaginateSetServerStatus {
-				status: ImaginateServerStatus::Unavailable,
-			}
-			.into(),
-		};
-		self.dispatch(message);
-	}
-
-	/// Sends the blob URL generated by JS to the Imaginate layer in the respective document
-	#[wasm_bindgen(js_name = processNodeGraphFrame)]
-	pub fn process_node_graph_frame(&self, document_id: u64, layer_path: Vec<LayerId>, image_data: Vec<u8>, width: u32, height: u32) {
-		let message = PortfolioMessage::ProcessNodeGraphFrame {
-			document_id,
-			layer_path,
-			image_data,
-			size: (width, height),
-		};
-		self.dispatch(message);
-	}
-
-	/// Notifies the backend that the user connected a node's primary output to one of another node's inputs
-	#[wasm_bindgen(js_name = connectNodesByLink)]
-	pub fn connect_nodes_by_link(&self, output_node: u64, input_node: u64, input_node_connector_index: usize) {
-		let message = NodeGraphMessage::ConnectNodesByLink {
-			output_node,
-			input_node,
-			input_node_connector_index,
-		};
+		let message = NavigationMessage::CanvasPanByViewportFraction { delta: (delta_x, delta_y).into() };
 		self.dispatch(message);
 	}
 
 	/// Creates a new document node in the node graph
 	#[wasm_bindgen(js_name = createNode)]
 	pub fn create_node(&self, node_type: String, x: i32, y: i32) {
-		let message = NodeGraphMessage::CreateNode { node_id: None, node_type, x, y };
+		let id = NodeId(generate_uuid());
+		let message = NodeGraphMessage::CreateNode { node_id: Some(id), node_type, x, y };
 		self.dispatch(message);
 	}
 
-	/// Notifies the backend that the user selected a node in the node graph
-	#[wasm_bindgen(js_name = selectNodes)]
-	pub fn select_nodes(&self, nodes: Vec<u64>) {
-		let message = NodeGraphMessage::SelectNodes { nodes };
+	/// Pastes the nodes based on serialized data
+	#[wasm_bindgen(js_name = pasteSerializedNodes)]
+	pub fn paste_serialized_nodes(&self, serialized_nodes: String) {
+		let message = NodeGraphMessage::PasteNodes { serialized_nodes };
 		self.dispatch(message);
 	}
 
-	/// Notifies the backend that the selected nodes have been moved
-	#[wasm_bindgen(js_name = moveSelectedNodes)]
-	pub fn move_selected_nodes(&self, displacement_x: i32, displacement_y: i32) {
-		let message = NodeGraphMessage::MoveSelectedNodes { displacement_x, displacement_y };
+	/// Go back a certain number of nested levels
+	#[wasm_bindgen(js_name = exitNestedNetwork)]
+	pub fn exit_nested_network(&self, steps_back: usize) {
+		let message = NodeGraphMessage::ExitNestedNetwork { steps_back };
 		self.dispatch(message);
 	}
 
 	/// Pastes an image
 	#[wasm_bindgen(js_name = pasteImage)]
-	pub fn paste_image(&self, mime: String, image_data: Vec<u8>, mouse_x: Option<f64>, mouse_y: Option<f64>) {
+	pub fn paste_image(&self, image_data: Vec<u8>, width: u32, height: u32, mouse_x: Option<f64>, mouse_y: Option<f64>) {
 		let mouse = mouse_x.and_then(|x| mouse_y.map(|y| (x, y)));
-		let message = DocumentMessage::PasteImage { mime, image_data, mouse };
+		let image = graphene_core::raster::Image::from_image_data(&image_data, width, height);
+		let message = DocumentMessage::PasteImage { image, mouse };
 		self.dispatch(message);
 	}
 
-	/// Toggle visibility of a layer from the layer list
-	#[wasm_bindgen(js_name = toggleLayerVisibility)]
-	pub fn toggle_layer_visibility(&self, layer_path: Vec<LayerId>) {
-		let message = DocumentMessage::ToggleLayerVisibility { layer_path };
+	#[wasm_bindgen(js_name = pasteSvg)]
+	pub fn paste_svg(&self, svg: String, mouse_x: Option<f64>, mouse_y: Option<f64>) {
+		let mouse = mouse_x.and_then(|x| mouse_y.map(|y| (x, y)));
+		let message = DocumentMessage::PasteSvg { svg, mouse };
+		self.dispatch(message);
+	}
+
+	/// Toggle visibility of a layer or node given its node ID
+	#[wasm_bindgen(js_name = toggleNodeVisibilityLayerPanel)]
+	pub fn toggle_node_visibility_layer(&self, id: u64) {
+		let node_id = NodeId(id);
+		let message = GraphOperationMessage::ToggleVisibility { node_id };
+		self.dispatch(message);
+	}
+
+	/// Delete a layer or node given its node ID
+	#[wasm_bindgen(js_name = deleteNode)]
+	pub fn delete_node(&self, id: u64) {
+		let message = DocumentMessage::StartTransaction;
+		self.dispatch(message);
+
+		let id = NodeId(id);
+		let message = NodeGraphMessage::DeleteNodes { node_ids: vec![id], reconnect: true };
+		self.dispatch(message);
+	}
+
+	/// Toggle lock state of a layer from the layer list
+	#[wasm_bindgen(js_name = toggleLayerLock)]
+	pub fn toggle_layer_lock(&self, id: u64) {
+		let node_id = NodeId(id);
+		let message = GraphOperationMessage::ToggleLocked { node_id };
 		self.dispatch(message);
 	}
 
 	/// Toggle expansions state of a layer from the layer list
 	#[wasm_bindgen(js_name = toggleLayerExpansion)]
-	pub fn toggle_layer_expansion(&self, layer_path: Vec<LayerId>) {
-		let message = DocumentMessage::ToggleLayerExpansion { layer_path };
+	pub fn toggle_layer_expansion(&self, id: u64) {
+		let id = NodeId(id);
+		let message = DocumentMessage::ToggleLayerExpansion { id };
 		self.dispatch(message);
 	}
-}
 
-// Needed to make JsEditorHandle functions pub to Rust.
-// The reason is not fully clear but it has to do with the #[wasm_bindgen] procedural macro.
-impl JsEditorHandle {
-	pub fn send_frontend_message_to_js_rust_proxy(&self, message: FrontendMessage) {
-		self.send_frontend_message_to_js(message);
+	/// Toggle display type for a layer
+	#[wasm_bindgen(js_name = setToNodeOrLayer)]
+	pub fn set_to_node_or_layer(&self, id: u64, is_layer: bool) {
+		let node_id = NodeId(id);
+		let message = NodeGraphMessage::SetToNodeOrLayer { node_id, is_layer };
+		self.dispatch(message);
+	}
+
+	#[wasm_bindgen(js_name = injectImaginatePollServerStatus)]
+	pub fn inject_imaginate_poll_server_status(&self) {
+		self.dispatch(PortfolioMessage::ImaginatePollServerStatus);
 	}
 }
 
-impl Drop for JsEditorHandle {
-	fn drop(&mut self) {
-		// Consider removing after https://github.com/rustwasm/wasm-bindgen/pull/2984 is merged and released
-		EDITOR_INSTANCES.with(|instances| instances.borrow_mut().remove(&self.editor_id));
+// ============================================================================
+
+#[wasm_bindgen(js_name = evaluateMathExpression)]
+pub fn evaluate_math_expression(expression: &str) -> Option<f64> {
+	// TODO: Rewrite our own purpose-built math expression parser that supports unit conversions.
+
+	let mut context = meval::Context::new();
+	context.var("tau", std::f64::consts::TAU);
+	context.func("log", f64::log10);
+	context.func("log10", f64::log10);
+	context.func("log2", f64::log2);
+
+	// Insert asterisks where implicit multiplication is used in the expression string
+	let expression = implicit_multiplication_preprocess(expression);
+
+	meval::eval_str_with_context(expression, &context).ok()
+}
+
+// Modified from this public domain snippet: <https://gist.github.com/Titaniumtown/c181be5d06505e003d8c4d1e372684ff>
+// Discussion: <https://github.com/rekka/meval-rs/issues/28#issuecomment-1826381922>
+pub fn implicit_multiplication_preprocess(expression: &str) -> String {
+	let function = expression.to_lowercase().replace("log10(", "log(").replace("log2(", "logtwo(").replace("pi", "π").replace("tau", "τ");
+	let valid_variables: Vec<char> = "eπτ".chars().collect();
+	let letters: Vec<char> = ('a'..='z').chain('A'..='Z').collect();
+	let numbers: Vec<char> = ('0'..='9').collect();
+	let function_chars: Vec<char> = function.chars().collect();
+	let mut output_string: String = String::new();
+	let mut prev_chars: Vec<char> = Vec::new();
+
+	for c in function_chars {
+		let mut add_asterisk: bool = false;
+		let prev_chars_len = prev_chars.len();
+
+		let prev_prev_char = if prev_chars_len >= 2 { *prev_chars.get(prev_chars_len - 2).unwrap() } else { ' ' };
+
+		let prev_char = if prev_chars_len >= 1 { *prev_chars.get(prev_chars_len - 1).unwrap() } else { ' ' };
+
+		let c_letters_var = letters.contains(&c) | valid_variables.contains(&c);
+		let prev_letters_var = valid_variables.contains(&prev_char) | letters.contains(&prev_char);
+
+		if prev_char == ')' {
+			if (c == '(') | numbers.contains(&c) | c_letters_var {
+				add_asterisk = true;
+			}
+		} else if c == '(' {
+			if (valid_variables.contains(&prev_char) | (')' == prev_char) | numbers.contains(&prev_char)) && !letters.contains(&prev_prev_char) {
+				add_asterisk = true;
+			}
+		} else if numbers.contains(&prev_char) {
+			if (c == '(') | c_letters_var {
+				add_asterisk = true;
+			}
+		} else if letters.contains(&c) {
+			if numbers.contains(&prev_char) | (valid_variables.contains(&prev_char) && valid_variables.contains(&c)) {
+				add_asterisk = true;
+			}
+		} else if (numbers.contains(&c) | c_letters_var) && prev_letters_var {
+			add_asterisk = true;
+		}
+
+		if add_asterisk {
+			output_string += "*";
+		}
+
+		prev_chars.push(c);
+		output_string += &c.to_string();
 	}
+
+	// We have to convert the Greek symbols back to ASCII because meval doesn't support unicode symbols as context constants
+	output_string.replace("logtwo(", "log2(").replace('π', "pi").replace('τ', "tau")
+}
+
+/// Helper function for calling JS's `requestAnimationFrame` with the given closure
+fn request_animation_frame(f: &Closure<dyn FnMut(f64)>) {
+	web_sys::window()
+		.expect("No global `window` exists")
+		.request_animation_frame(f.as_ref().unchecked_ref())
+		.expect("Failed to call `requestAnimationFrame`");
+}
+
+/// Helper function for calling JS's `setTimeout` with the given closure and delay
+fn set_timeout(f: &Closure<dyn FnMut()>, delay: Duration) {
+	let delay = delay.clamp(Duration::ZERO, Duration::from_millis(i32::MAX as u64)).as_millis() as i32;
+	web_sys::window()
+		.expect("No global `window` exists")
+		.set_timeout_with_callback_and_timeout_and_arguments_0(f.as_ref().unchecked_ref(), delay)
+		.expect("Failed to call `setTimeout`");
+}
+
+/// Provides access to the `Editor` by calling the given closure with it as an argument.
+fn editor<T: Default>(callback: impl FnOnce(&mut editor::application::Editor) -> T) -> T {
+	EDITOR.with(|editor| {
+		let Some(Ok(mut editor)) = editor.get().map(RefCell::try_borrow_mut) else {
+			// TODO: Investigate if this should just panic instead, and if not doing so right now may be the cause of silent crashes that don't inform the user that the app has panicked
+			log::error!("Failed to borrow the editor");
+			return T::default();
+		};
+
+		callback(&mut *editor)
+	})
+}
+
+/// Provides access to the `Editor` and its `EditorHandle` by calling the given closure with them as arguments.
+fn editor_and_handle(mut callback: impl FnMut(&mut Editor, &mut EditorHandle)) {
+	editor(|editor| {
+		EDITOR_HANDLE.with(|editor_handle| {
+			let Some(Ok(mut handle)) = editor_handle.get().map(RefCell::try_borrow_mut) else {
+				log::error!("Failed to borrow editor handle");
+				return;
+			};
+
+			// Call the closure with the editor and its handle
+			callback(editor, &mut handle);
+		})
+	});
+}
+
+async fn poll_node_graph_evaluation() {
+	// Process no further messages after a crash to avoid spamming the console
+	if EDITOR_HAS_CRASHED.load(Ordering::SeqCst) {
+		return;
+	}
+
+	editor::node_graph_executor::run_node_graph().await;
+
+	editor_and_handle(|editor, handle| {
+		let mut messages = VecDeque::new();
+		editor.poll_node_graph_evaluation(&mut messages);
+
+		// Send each `FrontendMessage` to the JavaScript frontend
+		for response in messages.into_iter().flat_map(|message| editor.handle_message(message)) {
+			handle.send_frontend_message_to_js(response);
+		}
+
+		// If the editor cannot be borrowed then it has encountered a panic - we should just ignore new dispatches
+	})
+}
+
+fn auto_save_all_documents() {
+	// Process no further messages after a crash to avoid spamming the console
+	if EDITOR_HAS_CRASHED.load(Ordering::SeqCst) {
+		return;
+	}
+
+	editor_and_handle(|editor, handle| {
+		for message in editor.handle_message(PortfolioMessage::AutoSaveAllDocuments) {
+			handle.send_frontend_message_to_js(message);
+		}
+	});
+}
+
+#[test]
+fn implicit_multiplication_preprocess_tests() {
+	assert_eq!(implicit_multiplication_preprocess("2pi"), "2*pi");
+	assert_eq!(implicit_multiplication_preprocess("sin(2pi)"), "sin(2*pi)");
+	assert_eq!(implicit_multiplication_preprocess("2sin(pi)"), "2*sin(pi)");
+	assert_eq!(implicit_multiplication_preprocess("2sin(3(4 + 5))"), "2*sin(3*(4 + 5))");
+	assert_eq!(implicit_multiplication_preprocess("3abs(-4)"), "3*abs(-4)");
+	assert_eq!(implicit_multiplication_preprocess("-1(4)"), "-1*(4)");
+	assert_eq!(implicit_multiplication_preprocess("(-1)4"), "(-1)*4");
+	assert_eq!(implicit_multiplication_preprocess("(((-1)))(4)"), "(((-1)))*(4)");
+	assert_eq!(implicit_multiplication_preprocess("2sin(pi) + 2cos(tau)"), "2*sin(pi) + 2*cos(tau)");
 }

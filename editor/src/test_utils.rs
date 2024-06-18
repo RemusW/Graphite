@@ -6,7 +6,7 @@ use crate::messages::portfolio::utility_types::Platform;
 use crate::messages::prelude::*;
 use crate::messages::tool::utility_types::ToolType;
 
-use graphene::color::Color;
+use graphene_core::raster::color::Color;
 
 /// A set of utility functions to make the writing of editor test more declarative
 pub trait EditorTestUtils {
@@ -15,7 +15,7 @@ pub trait EditorTestUtils {
 	fn new_document(&mut self);
 
 	fn draw_rect(&mut self, x1: f64, y1: f64, x2: f64, y2: f64);
-	fn draw_shape(&mut self, x1: f64, y1: f64, x2: f64, y2: f64);
+	fn draw_polygon(&mut self, x1: f64, y1: f64, x2: f64, y2: f64);
 	fn draw_ellipse(&mut self, x1: f64, y1: f64, x2: f64, y2: f64);
 
 	/// Select given tool and drag it from (x1, y1) to (x2, y2)
@@ -52,8 +52,8 @@ impl EditorTestUtils for Editor {
 		self.drag_tool(ToolType::Rectangle, x1, y1, x2, y2);
 	}
 
-	fn draw_shape(&mut self, x1: f64, y1: f64, x2: f64, y2: f64) {
-		self.drag_tool(ToolType::Shape, x1, y1, x2, y2);
+	fn draw_polygon(&mut self, x1: f64, y1: f64, x2: f64, y2: f64) {
+		self.drag_tool(ToolType::Polygon, x1, y1, x2, y2);
 	}
 
 	fn draw_ellipse(&mut self, x1: f64, y1: f64, x2: f64, y2: f64) {
@@ -73,7 +73,7 @@ impl EditorTestUtils for Editor {
 	}
 
 	fn move_mouse(&mut self, x: f64, y: f64) {
-		let mut editor_mouse_state = EditorMouseState::new();
+		let mut editor_mouse_state = EditorMouseState::default();
 		editor_mouse_state.editor_position = ViewportPosition::new(x, y);
 		let modifier_keys = ModifierKeys::default();
 		self.input(InputPreprocessorMessage::PointerMove { editor_mouse_state, modifier_keys });

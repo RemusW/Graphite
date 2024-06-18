@@ -6,15 +6,12 @@ pub struct BroadcastMessageHandler {
 }
 
 impl MessageHandler<BroadcastMessage, ()> for BroadcastMessageHandler {
-	#[remain::check]
-	fn process_message(&mut self, message: BroadcastMessage, _data: (), responses: &mut VecDeque<Message>) {
-		#[remain::sorted]
+	fn process_message(&mut self, message: BroadcastMessage, responses: &mut VecDeque<Message>, _data: ()) {
 		match message {
 			// Sub-messages
-			#[remain::unsorted]
 			BroadcastMessage::TriggerEvent(event) => {
 				for message in self.listeners.entry(event).or_default() {
-					responses.push_front(message.clone())
+					responses.add_front(message.clone())
 				}
 			}
 
@@ -25,6 +22,6 @@ impl MessageHandler<BroadcastMessage, ()> for BroadcastMessageHandler {
 	}
 
 	fn actions(&self) -> ActionList {
-		vec![]
+		actions!(BroadcastEventDiscriminant;)
 	}
 }

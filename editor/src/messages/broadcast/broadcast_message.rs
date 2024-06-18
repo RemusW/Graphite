@@ -1,13 +1,9 @@
 use crate::messages::prelude::*;
 
-use serde::{Deserialize, Serialize};
-
-#[remain::sorted]
 #[impl_message(Message, Broadcast)]
-#[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum BroadcastMessage {
 	// Sub-messages
-	#[remain::unsorted]
 	#[child]
 	TriggerEvent(BroadcastEvent),
 

@@ -1,22 +1,23 @@
 use crate::messages::input_mapper::utility_types::input_keyboard::Key;
+use crate::messages::input_mapper::utility_types::input_mouse::MouseButton;
 use crate::messages::prelude::*;
 
-use serde::{Deserialize, Serialize};
-
-#[remain::sorted]
-#[impl_message(Message, InputMapper)]
-#[derive(PartialEq, Eq, Clone, Debug, Hash, Serialize, Deserialize)]
+#[impl_message(Message, KeyMappingMessage, Lookup)]
+#[derive(PartialEq, Eq, Clone, Debug, Hash, serde::Serialize, serde::Deserialize)]
 pub enum InputMapperMessage {
 	// Sub-messages
-	#[remain::unsorted]
 	#[child]
 	KeyDown(Key),
-	#[remain::unsorted]
 	#[child]
 	KeyUp(Key),
+	#[child]
+	KeyDownNoRepeat(Key),
+	#[child]
+	KeyUpNoRepeat(Key),
+	#[child]
+	DoubleClick(MouseButton),
 
 	// Messages
-	DoubleClick,
 	PointerMove,
 	WheelScroll,
 }

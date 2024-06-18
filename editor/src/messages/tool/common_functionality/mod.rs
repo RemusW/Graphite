@@ -1,7 +1,9 @@
-pub mod overlay_renderer;
-pub mod path_outline;
+pub mod auto_panning;
+pub mod color_selector;
+pub mod graph_modification_utils;
 pub mod pivot;
 pub mod resize;
 pub mod shape_editor;
 pub mod snapping;
 pub mod transformation_cage;
+pub mod utility_functions;

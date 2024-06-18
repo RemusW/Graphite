@@ -1,14 +1,16 @@
 use crate::messages::input_mapper::utility_types::misc::ActionKeys;
-use crate::messages::layout::utility_types::layout_widget::WidgetCallback;
+use crate::messages::layout::utility_types::widget_prelude::*;
 
-use graphene::{color::Color, layers::layer_info::LayerDataTypeDiscriminant, LayerId};
+use graphene_core::{raster::curve::Curve, Color};
+use graphite_proc_macros::WidgetBuilder;
 
 use derivative::*;
-use serde::{Deserialize, Serialize};
+use glam::DVec2;
 
-#[derive(Clone, Derivative, Serialize, Deserialize)]
+#[derive(Clone, Derivative, serde::Serialize, serde::Deserialize, WidgetBuilder, specta::Type)]
 #[derivative(Debug, PartialEq)]
 pub struct CheckboxInput {
+	#[widget_builder(constructor)]
 	pub checked: bool,
 
 	pub disabled: bool,
@@ -24,6 +26,10 @@ pub struct CheckboxInput {
 	#[serde(skip)]
 	#[derivative(Debug = "ignore", PartialEq = "ignore")]
 	pub on_update: WidgetCallback<CheckboxInput>,
+
+	#[serde(skip)]
+	#[derivative(Debug = "ignore", PartialEq = "ignore")]
+	pub on_commit: WidgetCallback<()>,
 }
 
 impl Default for CheckboxInput {
@@ -35,37 +41,16 @@ impl Default for CheckboxInput {
 			tooltip: Default::default(),
 			tooltip_shortcut: Default::default(),
 			on_update: Default::default(),
+			on_commit: Default::default(),
 		}
 	}
 }
 
-#[derive(Clone, Derivative, Serialize, Deserialize)]
-#[derivative(Debug, PartialEq, Default)]
-pub struct ColorInput {
-	pub value: Option<Color>,
-
-	// TODO: Add allow_none
-	#[serde(rename = "noTransparency")]
-	#[derivative(Default(value = "true"))]
-	pub no_transparency: bool, // TODO: Rename allow_transparency (and invert usages)
-
-	pub disabled: bool,
-
-	pub tooltip: String,
-
-	#[serde(skip)]
-	pub tooltip_shortcut: Option<ActionKeys>,
-
-	// Callbacks
-	#[serde(skip)]
-	#[derivative(Debug = "ignore", PartialEq = "ignore")]
-	pub on_update: WidgetCallback<ColorInput>,
-}
-
-#[derive(Clone, Serialize, Deserialize, Derivative)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Derivative, WidgetBuilder, specta::Type)]
 #[derivative(Debug, PartialEq, Default)]
 pub struct DropdownInput {
-	pub entries: DropdownInputEntries,
+	#[widget_builder(constructor)]
+	pub entries: MenuListEntrySections,
 
 	// This uses `u32` instead of `usize` since it will be serialized as a normal JS number (replace this with `usize` after switching to a Rust-based GUI)
 	#[serde(rename = "selectedIndex")]
@@ -85,14 +70,16 @@ pub struct DropdownInput {
 	pub tooltip_shortcut: Option<ActionKeys>,
 	//
 	// Callbacks
-	// `on_update` exists on the `DropdownEntryData`, not this parent `DropdownInput`
+	// `on_update` exists on the `MenuListEntry`, not this parent `DropdownInput`
 }
 
-pub type DropdownInputEntries = Vec<Vec<DropdownEntryData>>;
+pub type MenuListEntrySections = Vec<Vec<MenuListEntry>>;
 
-#[derive(Clone, Serialize, Deserialize, Derivative, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Derivative, Default, WidgetBuilder, specta::Type)]
 #[derivative(Debug, PartialEq)]
-pub struct DropdownEntryData {
+#[widget_builder(not_widget_holder)]
+pub struct MenuListEntry {
+	#[widget_builder(constructor)]
 	pub value: String,
 
 	pub label: String,
@@ -106,21 +93,27 @@ pub struct DropdownEntryData {
 
 	pub disabled: bool,
 
-	pub children: DropdownInputEntries,
+	pub children: MenuListEntrySections,
 
 	// Callbacks
 	#[serde(skip)]
 	#[derivative(Debug = "ignore", PartialEq = "ignore")]
 	pub on_update: WidgetCallback<()>,
+
+	#[serde(skip)]
+	#[derivative(Debug = "ignore", PartialEq = "ignore")]
+	pub on_commit: WidgetCallback<()>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Derivative)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Derivative, WidgetBuilder, specta::Type)]
 #[derivative(Debug, PartialEq, Default)]
 pub struct FontInput {
 	#[serde(rename = "fontFamily")]
+	#[widget_builder(constructor)]
 	pub font_family: String,
 
 	#[serde(rename = "fontStyle")]
+	#[widget_builder(constructor)]
 	pub font_style: String,
 
 	#[serde(rename = "isStyle")]
@@ -137,48 +130,28 @@ pub struct FontInput {
 	#[serde(skip)]
 	#[derivative(Debug = "ignore", PartialEq = "ignore")]
 	pub on_update: WidgetCallback<FontInput>,
+
+	#[serde(skip)]
+	#[derivative(Debug = "ignore", PartialEq = "ignore")]
+	pub on_commit: WidgetCallback<()>,
 }
 
 /// This widget allows for the flexible use of the layout system.
 /// In a custom layout, one can define a widget that is just used to trigger code on the backend.
 /// This is used in MenuLayout to pipe the triggering of messages from the frontend to backend.
-#[derive(Clone, Serialize, Deserialize, Derivative, Default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Derivative, Default, WidgetBuilder, specta::Type)]
 #[derivative(Debug, PartialEq)]
 pub struct InvisibleStandinInput {
 	#[serde(skip)]
 	#[derivative(Debug = "ignore", PartialEq = "ignore")]
 	pub on_update: WidgetCallback<()>,
-}
 
-#[derive(Clone, Serialize, Deserialize, Derivative)]
-#[derivative(Debug, PartialEq, Default)]
-pub struct LayerReferenceInput {
-	pub value: Option<Vec<LayerId>>,
-
-	#[serde(rename = "layerName")]
-	pub layer_name: Option<String>,
-
-	#[serde(rename = "layerType")]
-	pub layer_type: Option<LayerDataTypeDiscriminant>,
-
-	pub disabled: bool,
-
-	pub tooltip: String,
-
-	#[serde(skip)]
-	pub tooltip_shortcut: Option<ActionKeys>,
-
-	// Styling
-	#[serde(rename = "minWidth")]
-	pub min_width: u32,
-
-	// Callbacks
 	#[serde(skip)]
 	#[derivative(Debug = "ignore", PartialEq = "ignore")]
-	pub on_update: WidgetCallback<LayerReferenceInput>,
+	pub on_commit: WidgetCallback<()>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Derivative)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Derivative, WidgetBuilder, specta::Type)]
 #[derivative(Debug, PartialEq, Default)]
 pub struct NumberInput {
 	// Label
@@ -193,10 +166,13 @@ pub struct NumberInput {
 	pub disabled: bool,
 
 	// Value
+	#[widget_builder(constructor)]
 	pub value: Option<f64>,
 
+	#[widget_builder(skip)]
 	pub min: Option<f64>,
 
+	#[widget_builder(skip)]
 	pub max: Option<f64>,
 
 	#[serde(rename = "isInteger")]
@@ -204,7 +180,7 @@ pub struct NumberInput {
 
 	// Number presentation
 	#[serde(rename = "displayDecimalPlaces")]
-	#[derivative(Default(value = "3"))]
+	#[derivative(Default(value = "2"))]
 	pub display_decimal_places: u32,
 
 	pub unit: String,
@@ -244,9 +220,45 @@ pub struct NumberInput {
 	#[serde(skip)]
 	#[derivative(Debug = "ignore", PartialEq = "ignore")]
 	pub on_update: WidgetCallback<NumberInput>,
+
+	#[serde(skip)]
+	#[derivative(Debug = "ignore", PartialEq = "ignore")]
+	pub on_commit: WidgetCallback<()>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+impl NumberInput {
+	pub fn int(mut self) -> Self {
+		self.is_integer = true;
+		self
+	}
+	pub fn min(mut self, val: f64) -> Self {
+		self.min = Some(val);
+		self.range_min = Some(val);
+		self
+	}
+	pub fn max(mut self, val: f64) -> Self {
+		self.max = Some(val);
+		self.range_max = Some(val);
+		self
+	}
+	pub fn mode_range(mut self) -> Self {
+		self.mode = NumberInputMode::Range;
+		self
+	}
+	pub fn mode_increment(mut self) -> Self {
+		self.mode = NumberInputMode::Increment;
+		self
+	}
+	pub fn increment_step(mut self, step: f64) -> Self {
+		self.step = step;
+		self
+	}
+	pub fn percentage(self) -> Self {
+		self.min(0.).max(100.).mode_range().unit("%").display_decimal_places(2)
+	}
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default, PartialEq, Eq, specta::Type)]
 pub enum NumberInputIncrementBehavior {
 	#[default]
 	Add,
@@ -254,48 +266,34 @@ pub enum NumberInputIncrementBehavior {
 	Callback,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default, PartialEq, Eq, specta::Type)]
 pub enum NumberInputMode {
 	#[default]
 	Increment,
 	Range,
 }
 
-#[derive(Clone, Default, Derivative, Serialize, Deserialize)]
-#[derivative(Debug, PartialEq)]
-pub struct OptionalInput {
-	pub checked: bool,
-
-	pub disabled: bool,
-
-	pub icon: String,
-
-	pub tooltip: String,
-
-	#[serde(skip)]
-	pub tooltip_shortcut: Option<ActionKeys>,
-
-	// Callbacks
-	#[serde(skip)]
-	#[derivative(Debug = "ignore", PartialEq = "ignore")]
-	pub on_update: WidgetCallback<OptionalInput>,
-}
-
-#[derive(Clone, Default, Derivative, Serialize, Deserialize)]
+#[derive(Clone, Default, Derivative, serde::Serialize, serde::Deserialize, WidgetBuilder, specta::Type)]
 #[derivative(Debug, PartialEq)]
 pub struct RadioInput {
+	#[widget_builder(constructor)]
 	pub entries: Vec<RadioEntryData>,
 
 	pub disabled: bool,
 
 	// This uses `u32` instead of `usize` since it will be serialized as a normal JS number (replace this with `usize` after switching to a Rust-based GUI)
 	#[serde(rename = "selectedIndex")]
-	pub selected_index: u32,
+	pub selected_index: Option<u32>,
+
+	#[serde(rename = "minWidth")]
+	pub min_width: u32,
 }
 
-#[derive(Clone, Default, Derivative, Serialize, Deserialize)]
+#[derive(Clone, Default, Derivative, serde::Serialize, serde::Deserialize, WidgetBuilder, specta::Type)]
 #[derivative(Debug, PartialEq)]
+#[widget_builder(not_widget_holder)]
 pub struct RadioEntryData {
+	#[widget_builder(constructor)]
 	pub value: String,
 
 	pub label: String,
@@ -311,19 +309,26 @@ pub struct RadioEntryData {
 	#[serde(skip)]
 	#[derivative(Debug = "ignore", PartialEq = "ignore")]
 	pub on_update: WidgetCallback<()>,
+
+	#[serde(skip)]
+	#[derivative(Debug = "ignore", PartialEq = "ignore")]
+	pub on_commit: WidgetCallback<()>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Derivative)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Derivative, WidgetBuilder, specta::Type)]
 #[derivative(Debug, PartialEq, Default)]
-pub struct SwatchPairInput {
+pub struct WorkingColorsInput {
+	#[widget_builder(constructor)]
 	pub primary: Color,
 
+	#[widget_builder(constructor)]
 	pub secondary: Color,
 }
 
-#[derive(Clone, Serialize, Deserialize, Derivative)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Derivative, WidgetBuilder, specta::Type)]
 #[derivative(Debug, PartialEq, Default)]
 pub struct TextAreaInput {
+	#[widget_builder(constructor)]
 	pub value: String,
 
 	pub label: Option<String>,
@@ -336,11 +341,16 @@ pub struct TextAreaInput {
 	#[serde(skip)]
 	#[derivative(Debug = "ignore", PartialEq = "ignore")]
 	pub on_update: WidgetCallback<TextAreaInput>,
+
+	#[serde(skip)]
+	#[derivative(Debug = "ignore", PartialEq = "ignore")]
+	pub on_commit: WidgetCallback<()>,
 }
 
-#[derive(Clone, Serialize, Deserialize, Derivative)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Derivative, WidgetBuilder, specta::Type)]
 #[derivative(Debug, PartialEq, Default)]
 pub struct TextInput {
+	#[widget_builder(constructor)]
 	pub value: String,
 
 	pub label: Option<String>,
@@ -358,4 +368,128 @@ pub struct TextInput {
 	#[serde(skip)]
 	#[derivative(Debug = "ignore", PartialEq = "ignore")]
 	pub on_update: WidgetCallback<TextInput>,
+
+	#[serde(skip)]
+	#[derivative(Debug = "ignore", PartialEq = "ignore")]
+	pub on_commit: WidgetCallback<()>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Derivative, WidgetBuilder, specta::Type)]
+#[derivative(Debug, PartialEq, Default)]
+pub struct CurveInput {
+	#[widget_builder(constructor)]
+	pub value: Curve,
+
+	pub disabled: bool,
+
+	pub tooltip: String,
+
+	// Callbacks
+	#[serde(skip)]
+	#[derivative(Debug = "ignore", PartialEq = "ignore")]
+	pub on_update: WidgetCallback<CurveInput>,
+
+	#[serde(skip)]
+	#[derivative(Debug = "ignore", PartialEq = "ignore")]
+	pub on_commit: WidgetCallback<()>,
+}
+
+#[derive(Clone, Default, Derivative, serde::Serialize, serde::Deserialize, WidgetBuilder, specta::Type)]
+#[derivative(Debug, PartialEq)]
+pub struct PivotInput {
+	#[widget_builder(constructor)]
+	pub position: PivotPosition,
+
+	pub disabled: bool,
+
+	// Callbacks
+	#[serde(skip)]
+	#[derivative(Debug = "ignore", PartialEq = "ignore")]
+	pub on_update: WidgetCallback<PivotInput>,
+
+	#[serde(skip)]
+	#[derivative(Debug = "ignore", PartialEq = "ignore")]
+	pub on_commit: WidgetCallback<()>,
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, Debug, Default, PartialEq, Eq, specta::Type)]
+pub enum PivotPosition {
+	#[default]
+	None,
+	TopLeft,
+	TopCenter,
+	TopRight,
+	CenterLeft,
+	Center,
+	CenterRight,
+	BottomLeft,
+	BottomCenter,
+	BottomRight,
+}
+
+impl From<&str> for PivotPosition {
+	fn from(input: &str) -> Self {
+		match input {
+			"None" => PivotPosition::None,
+			"TopLeft" => PivotPosition::TopLeft,
+			"TopCenter" => PivotPosition::TopCenter,
+			"TopRight" => PivotPosition::TopRight,
+			"CenterLeft" => PivotPosition::CenterLeft,
+			"Center" => PivotPosition::Center,
+			"CenterRight" => PivotPosition::CenterRight,
+			"BottomLeft" => PivotPosition::BottomLeft,
+			"BottomCenter" => PivotPosition::BottomCenter,
+			"BottomRight" => PivotPosition::BottomRight,
+			_ => panic!("Failed parsing unrecognized PivotPosition enum value '{input}'"),
+		}
+	}
+}
+
+impl From<PivotPosition> for Option<DVec2> {
+	fn from(input: PivotPosition) -> Self {
+		match input {
+			PivotPosition::None => None,
+			PivotPosition::TopLeft => Some(DVec2::new(0., 0.)),
+			PivotPosition::TopCenter => Some(DVec2::new(0.5, 0.)),
+			PivotPosition::TopRight => Some(DVec2::new(1., 0.)),
+			PivotPosition::CenterLeft => Some(DVec2::new(0., 0.5)),
+			PivotPosition::Center => Some(DVec2::new(0.5, 0.5)),
+			PivotPosition::CenterRight => Some(DVec2::new(1., 0.5)),
+			PivotPosition::BottomLeft => Some(DVec2::new(0., 1.)),
+			PivotPosition::BottomCenter => Some(DVec2::new(0.5, 1.)),
+			PivotPosition::BottomRight => Some(DVec2::new(1., 1.)),
+		}
+	}
+}
+
+impl From<DVec2> for PivotPosition {
+	fn from(input: DVec2) -> Self {
+		const TOLERANCE: f64 = 1e-5_f64;
+		if input.y.abs() < TOLERANCE {
+			if input.x.abs() < TOLERANCE {
+				return PivotPosition::TopLeft;
+			} else if (input.x - 0.5).abs() < TOLERANCE {
+				return PivotPosition::TopCenter;
+			} else if (input.x - 1.).abs() < TOLERANCE {
+				return PivotPosition::TopRight;
+			}
+		} else if (input.y - 0.5).abs() < TOLERANCE {
+			if input.x.abs() < TOLERANCE {
+				return PivotPosition::CenterLeft;
+			} else if (input.x - 0.5).abs() < TOLERANCE {
+				return PivotPosition::Center;
+			} else if (input.x - 1.).abs() < TOLERANCE {
+				return PivotPosition::CenterRight;
+			}
+		} else if (input.y - 1.).abs() < TOLERANCE {
+			if input.x.abs() < TOLERANCE {
+				return PivotPosition::BottomLeft;
+			} else if (input.x - 0.5).abs() < TOLERANCE {
+				return PivotPosition::BottomCenter;
+			} else if (input.x - 1.).abs() < TOLERANCE {
+				return PivotPosition::BottomRight;
+			}
+		}
+		PivotPosition::None
+	}
 }

@@ -1,24 +1,12 @@
-use crate::application::generate_uuid;
-use crate::consts::{COLOR_ACCENT, LINE_ROTATE_SNAP_ANGLE, MANIPULATOR_GROUP_MARKER_SIZE, SELECTION_TOLERANCE};
-use crate::messages::frontend::utility_types::MouseCursorIcon;
-use crate::messages::input_mapper::utility_types::input_keyboard::{Key, KeysGroup, MouseMotion};
-use crate::messages::layout::utility_types::layout_widget::{Layout, LayoutGroup, PropertyHolder, Widget, WidgetCallback, WidgetHolder, WidgetLayout};
-use crate::messages::layout::utility_types::widgets::input_widgets::{RadioEntryData, RadioInput};
-use crate::messages::prelude::*;
+use super::tool_prelude::*;
+use crate::consts::{LINE_ROTATE_SNAP_ANGLE, MANIPULATOR_GROUP_MARKER_SIZE, SELECTION_THRESHOLD};
+use crate::messages::portfolio::document::overlays::utility_types::OverlayContext;
+use crate::messages::portfolio::document::utility_types::document_metadata::LayerNodeIdentifier;
+use crate::messages::tool::common_functionality::auto_panning::AutoPanning;
+use crate::messages::tool::common_functionality::graph_modification_utils::get_gradient;
 use crate::messages::tool::common_functionality::snapping::SnapManager;
-use crate::messages::tool::utility_types::{EventToMessageMap, Fsm, ToolActionHandlerData, ToolMetadata, ToolTransition, ToolType};
-use crate::messages::tool::utility_types::{HintData, HintGroup, HintInfo};
 
-use graphene::color::Color;
-use graphene::intersection::Quad;
-use graphene::layers::layer_info::Layer;
-use graphene::layers::style::{Fill, Gradient, GradientType, PathStyle, Stroke};
-use graphene::LayerId;
-use graphene::Operation;
-
-use glam::{DAffine2, DVec2};
-use graphene::layers::text_layer::FontCache;
-use serde::{Deserialize, Serialize};
+use graphene_core::vector::style::{Fill, Gradient, GradientType};
 
 #[derive(Default)]
 pub struct GradientTool {
@@ -27,37 +15,29 @@ pub struct GradientTool {
 	options: GradientOptions,
 }
 
+#[derive(Default)]
 pub struct GradientOptions {
 	gradient_type: GradientType,
 }
 
-impl Default for GradientOptions {
-	fn default() -> Self {
-		Self { gradient_type: GradientType::Linear }
-	}
-}
-
-#[remain::sorted]
 #[impl_message(Message, ToolMessage, Gradient)]
-#[derive(PartialEq, Eq, Clone, Debug, Hash, Serialize, Deserialize)]
+#[derive(PartialEq, Clone, Debug, Hash, serde::Serialize, serde::Deserialize, specta::Type)]
 pub enum GradientToolMessage {
 	// Standard messages
-	#[remain::unsorted]
 	Abort,
-	#[remain::unsorted]
-	DocumentIsDirty,
+	Overlays(OverlayContext),
 
 	// Tool-specific messages
+	DeleteStop,
+	InsertStop,
 	PointerDown,
-	PointerMove {
-		constrain_axis: Key,
-	},
+	PointerMove { constrain_axis: Key },
+	PointerOutsideViewport { constrain_axis: Key },
 	PointerUp,
 	UpdateOptions(GradientOptionsUpdate),
 }
 
-#[remain::sorted]
-#[derive(PartialEq, Eq, Clone, Debug, Hash, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Debug, Hash, serde::Serialize, serde::Deserialize, specta::Type)]
 pub enum GradientOptionsUpdate {
 	Type(GradientType),
 }
@@ -74,29 +54,20 @@ impl ToolMetadata for GradientTool {
 	}
 }
 
-impl<'a> MessageHandler<ToolMessage, ToolActionHandlerData<'a>> for GradientTool {
-	fn process_message(&mut self, message: ToolMessage, data: ToolActionHandlerData<'a>, responses: &mut VecDeque<Message>) {
-		if message == ToolMessage::UpdateHints {
-			self.fsm_state.update_hints(responses);
+impl<'a> MessageHandler<ToolMessage, &mut ToolActionHandlerData<'a>> for GradientTool {
+	fn process_message(&mut self, message: ToolMessage, responses: &mut VecDeque<Message>, tool_data: &mut ToolActionHandlerData<'a>) {
+		let ToolMessage::Gradient(GradientToolMessage::UpdateOptions(action)) = message else {
+			self.fsm_state.process_event(message, &mut self.data, tool_data, &self.options, responses, false);
 			return;
-		}
-
-		if message == ToolMessage::UpdateCursor {
-			self.fsm_state.update_cursor(responses);
-			return;
-		}
-		if let ToolMessage::Gradient(GradientToolMessage::UpdateOptions(action)) = message {
-			match action {
-				GradientOptionsUpdate::Type(gradient_type) => self.options.gradient_type = gradient_type,
+		};
+		match action {
+			GradientOptionsUpdate::Type(gradient_type) => {
+				self.options.gradient_type = gradient_type;
+				if let Some(selected_gradient) = &mut self.data.selected_gradient {
+					selected_gradient.gradient.gradient_type = gradient_type;
+					selected_gradient.render_gradient(responses);
+				}
 			}
-			return;
-		}
-
-		let new_state = self.fsm_state.transition(message, &mut self.data, data, &self.options, responses);
-
-		if self.fsm_state != new_state {
-			self.fsm_state = new_state;
-			self.fsm_state.update_hints(responses);
 		}
 	}
 
@@ -105,160 +76,45 @@ impl<'a> MessageHandler<ToolMessage, ToolActionHandlerData<'a>> for GradientTool
 		PointerUp,
 		PointerMove,
 		Abort,
+		InsertStop,
+		DeleteStop,
 	);
 }
 
-impl PropertyHolder for GradientTool {
-	fn properties(&self) -> Layout {
-		Layout::WidgetLayout(WidgetLayout::new(vec![LayoutGroup::Row {
-			widgets: vec![WidgetHolder::new(Widget::RadioInput(RadioInput {
-				selected_index: if self.options.gradient_type == GradientType::Radial { 1 } else { 0 },
-				entries: vec![
-					RadioEntryData {
-						value: "linear".into(),
-						label: "Linear".into(),
-						tooltip: "Linear Gradient".into(),
-						on_update: WidgetCallback::new(move |_| GradientToolMessage::UpdateOptions(GradientOptionsUpdate::Type(GradientType::Linear)).into()),
-						..RadioEntryData::default()
-					},
-					RadioEntryData {
-						value: "radial".into(),
-						label: "Radial".into(),
-						tooltip: "Radial Gradient".into(),
-						on_update: WidgetCallback::new(move |_| GradientToolMessage::UpdateOptions(GradientOptionsUpdate::Type(GradientType::Radial)).into()),
-						..RadioEntryData::default()
-					},
-				],
-				..Default::default()
-			}))],
-		}]))
+impl LayoutHolder for GradientTool {
+	fn layout(&self) -> Layout {
+		let gradient_type = RadioInput::new(vec![
+			RadioEntryData::new("linear")
+				.label("Linear")
+				.tooltip("Linear Gradient")
+				.on_update(move |_| GradientToolMessage::UpdateOptions(GradientOptionsUpdate::Type(GradientType::Linear)).into()),
+			RadioEntryData::new("radial")
+				.label("Radial")
+				.tooltip("Radial Gradient")
+				.on_update(move |_| GradientToolMessage::UpdateOptions(GradientOptionsUpdate::Type(GradientType::Radial)).into()),
+		])
+		.selected_index(Some((self.selected_gradient().unwrap_or(self.options.gradient_type) == GradientType::Radial) as u32))
+		.widget_holder();
+
+		Layout::WidgetLayout(WidgetLayout::new(vec![LayoutGroup::Row { widgets: vec![gradient_type] }]))
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum GradientToolFsmState {
+	#[default]
 	Ready,
 	Drawing,
 }
 
-impl Default for GradientToolFsmState {
-	fn default() -> Self {
-		GradientToolFsmState::Ready
-	}
-}
-
-/// Computes the transform from gradient space to layer space (where gradient space is 0..1 in layer space)
-fn gradient_space_transform(path: &[LayerId], layer: &Layer, document: &DocumentMessageHandler, font_cache: &FontCache) -> DAffine2 {
-	let bounds = layer.aabb_for_transform(DAffine2::IDENTITY, font_cache).unwrap();
+/// Computes the transform from gradient space to viewport space (where gradient space is 0..1)
+fn gradient_space_transform(layer: LayerNodeIdentifier, document: &DocumentMessageHandler) -> DAffine2 {
+	let bounds = document.metadata().nonzero_bounding_box(layer);
 	let bound_transform = DAffine2::from_scale_angle_translation(bounds[1] - bounds[0], 0., bounds[0]);
 
-	let multiplied = document.graphene_document.multiply_transforms(path).unwrap();
+	let multiplied = document.metadata().transform_to_viewport(layer);
 
 	multiplied * bound_transform
-}
-
-/// Contains info on the overlays for a single gradient
-#[derive(Clone, Debug, Default)]
-pub struct GradientOverlay {
-	pub handles: [Vec<LayerId>; 2],
-	pub line: Vec<LayerId>,
-	pub steps: Vec<Vec<LayerId>>,
-	path: Vec<LayerId>,
-	transform: DAffine2,
-	gradient: Gradient,
-}
-
-impl GradientOverlay {
-	fn generate_overlay_handle(translation: DVec2, responses: &mut VecDeque<Message>, selected: bool) -> Vec<LayerId> {
-		let path = vec![generate_uuid()];
-
-		let size = DVec2::splat(MANIPULATOR_GROUP_MARKER_SIZE);
-
-		let fill = if selected { Fill::solid(COLOR_ACCENT) } else { Fill::solid(Color::WHITE) };
-
-		let operation = Operation::AddEllipse {
-			path: path.clone(),
-			transform: DAffine2::from_scale_angle_translation(size, 0., translation - size / 2.).to_cols_array(),
-			style: PathStyle::new(Some(Stroke::new(COLOR_ACCENT, 1.0)), fill),
-			insert_index: -1,
-		};
-		responses.push_back(DocumentMessage::Overlays(operation.into()).into());
-
-		path
-	}
-	fn generate_overlay_line(start: DVec2, end: DVec2, responses: &mut VecDeque<Message>) -> Vec<LayerId> {
-		let path = vec![generate_uuid()];
-
-		let line_vector = end - start;
-		let scale = DVec2::splat(line_vector.length());
-		let angle = -line_vector.angle_between(DVec2::X);
-		let translation = start;
-		let transform = DAffine2::from_scale_angle_translation(scale, angle, translation).to_cols_array();
-
-		let operation = Operation::AddLine {
-			path: path.clone(),
-			transform,
-			style: PathStyle::new(Some(Stroke::new(COLOR_ACCENT, 1.0)), Fill::None),
-			insert_index: -1,
-		};
-		responses.push_back(DocumentMessage::Overlays(operation.into()).into());
-
-		path
-	}
-
-	pub fn new(
-		fill: &Gradient,
-		dragging: Option<GradientDragTarget>,
-		path: &[LayerId],
-		layer: &Layer,
-		document: &DocumentMessageHandler,
-		responses: &mut VecDeque<Message>,
-		font_cache: &FontCache,
-	) -> Self {
-		let transform = gradient_space_transform(path, layer, document, font_cache);
-		let Gradient { start, end, positions, .. } = fill;
-		let [start, end] = [transform.transform_point2(*start), transform.transform_point2(*end)];
-
-		let line = Self::generate_overlay_line(start, end, responses);
-		let handles = [
-			Self::generate_overlay_handle(start, responses, dragging == Some(GradientDragTarget::Start)),
-			Self::generate_overlay_handle(end, responses, dragging == Some(GradientDragTarget::End)),
-		];
-
-		let not_at_end = |(_, x): &(_, f64)| x.abs() > f64::EPSILON * 1000. && (1. - x).abs() > f64::EPSILON * 1000.;
-		let create_step = |(index, pos)| Self::generate_overlay_handle(start.lerp(end, pos), responses, dragging == Some(GradientDragTarget::Step(index)));
-		let steps = positions.iter().map(|(pos, _)| *pos).enumerate().filter(not_at_end).map(create_step).collect();
-
-		let path = path.to_vec();
-		let gradient = fill.clone();
-
-		Self {
-			handles,
-			steps,
-			line,
-			path,
-			transform,
-			gradient,
-		}
-	}
-
-	pub fn delete_overlays(self, responses: &mut VecDeque<Message>) {
-		responses.push_back(DocumentMessage::Overlays(Operation::DeleteLayer { path: self.line }.into()).into());
-		let [start, end] = self.handles;
-		responses.push_back(DocumentMessage::Overlays(Operation::DeleteLayer { path: start }.into()).into());
-		responses.push_back(DocumentMessage::Overlays(Operation::DeleteLayer { path: end }.into()).into());
-		for step in self.steps {
-			responses.push_back(DocumentMessage::Overlays(Operation::DeleteLayer { path: step }.into()).into());
-		}
-	}
-
-	pub fn evaluate_gradient_start(&self) -> DVec2 {
-		self.transform.transform_point2(self.gradient.start)
-	}
-
-	pub fn evaluate_gradient_end(&self) -> DVec2 {
-		self.transform.transform_point2(self.gradient.end)
-	}
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
@@ -272,17 +128,17 @@ pub enum GradientDragTarget {
 /// Contains information about the selected gradient handle
 #[derive(Clone, Debug, Default)]
 struct SelectedGradient {
-	path: Vec<LayerId>,
+	layer: Option<LayerNodeIdentifier>,
 	transform: DAffine2,
 	gradient: Gradient,
 	dragging: GradientDragTarget,
 }
 
 impl SelectedGradient {
-	pub fn new(gradient: Gradient, path: &[LayerId], layer: &Layer, document: &DocumentMessageHandler, font_cache: &FontCache) -> Self {
-		let transform = gradient_space_transform(path, layer, document, font_cache);
+	pub fn new(gradient: Gradient, layer: LayerNodeIdentifier, document: &DocumentMessageHandler) -> Self {
+		let transform = gradient_space_transform(layer, document);
 		Self {
-			path: path.to_vec(),
+			layer: Some(layer),
 			transform,
 			gradient,
 			dragging: GradientDragTarget::End,
@@ -316,228 +172,339 @@ impl SelectedGradient {
 			mouse = point - rotated;
 		}
 
-		mouse = self.transform.inverse().transform_point2(mouse);
+		let transformed_mouse = self.transform.inverse().transform_point2(mouse);
 
 		match self.dragging {
-			GradientDragTarget::Start => self.gradient.start = mouse,
-			GradientDragTarget::End => self.gradient.end = mouse,
+			GradientDragTarget::Start => self.gradient.start = transformed_mouse,
+			GradientDragTarget::End => self.gradient.end = transformed_mouse,
 			GradientDragTarget::Step(s) => {
+				let (start, end) = (self.transform.transform_point2(self.gradient.start), self.transform.transform_point2(self.gradient.end));
+
 				// Calculate the new position by finding the closest point on the line
-				let new_pos = ((self.gradient.end - self.gradient.start).angle_between(mouse - self.gradient.start)).cos() * self.gradient.start.distance(mouse)
-					/ self.gradient.start.distance(self.gradient.end);
+				let new_pos = ((end - start).angle_between(mouse - start)).cos() * start.distance(mouse) / start.distance(end);
 
-				// Should not go off end but can swap (like inscape)
+				// Should not go off end but can swap
 				let clamped = new_pos.clamp(0., 1.);
-				self.gradient.positions[s].0 = clamped;
-				let new_pos = self.gradient.positions[s];
+				self.gradient.stops.0[s].0 = clamped;
+				let new_pos = self.gradient.stops.0[s];
 
-				self.gradient.positions.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-				self.dragging = GradientDragTarget::Step(self.gradient.positions.iter().position(|x| *x == new_pos).unwrap());
+				self.gradient.stops.0.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+				self.dragging = GradientDragTarget::Step(self.gradient.stops.0.iter().position(|x| *x == new_pos).unwrap());
 			}
 		}
+		self.render_gradient(responses);
+	}
 
+	/// Update the layer fill to the current gradient
+	pub fn render_gradient(&mut self, responses: &mut VecDeque<Message>) {
 		self.gradient.transform = self.transform;
-		let fill = Fill::Gradient(self.gradient.clone());
-		let path = self.path.clone();
-		responses.push_back(Operation::SetLayerFill { path, fill }.into());
+		if let Some(layer) = self.layer {
+			responses.add(GraphOperationMessage::FillSet {
+				layer,
+				fill: Fill::Gradient(self.gradient.clone()),
+			});
+		}
+	}
+}
+
+impl GradientTool {
+	/// Get the gradient type of the selected gradient (if it exists)
+	pub fn selected_gradient(&self) -> Option<GradientType> {
+		self.data.selected_gradient.as_ref().map(|selected| selected.gradient.gradient_type)
 	}
 }
 
 impl ToolTransition for GradientTool {
 	fn event_to_message_map(&self) -> EventToMessageMap {
 		EventToMessageMap {
-			document_dirty: Some(GradientToolMessage::DocumentIsDirty.into()),
 			tool_abort: Some(GradientToolMessage::Abort.into()),
-			selection_changed: None,
+			overlay_provider: Some(|overlay_context| GradientToolMessage::Overlays(overlay_context).into()),
+			..Default::default()
 		}
 	}
 }
 
 #[derive(Clone, Debug, Default)]
 struct GradientToolData {
-	gradient_overlays: Vec<GradientOverlay>,
 	selected_gradient: Option<SelectedGradient>,
 	snap_manager: SnapManager,
-}
-
-pub fn start_snap(snap_manager: &mut SnapManager, document: &DocumentMessageHandler, font_cache: &FontCache) {
-	snap_manager.start_snap(document, document.bounding_boxes(None, None, font_cache), true, true);
-	snap_manager.add_all_document_handles(document, &[], &[], &[]);
+	drag_start: DVec2,
+	auto_panning: AutoPanning,
 }
 
 impl Fsm for GradientToolFsmState {
 	type ToolData = GradientToolData;
 	type ToolOptions = GradientOptions;
 
-	fn transition(
-		self,
-		event: ToolMessage,
-		tool_data: &mut Self::ToolData,
-		(document, _document_id, global_tool_data, input, font_cache): ToolActionHandlerData,
-		tool_options: &Self::ToolOptions,
-		responses: &mut VecDeque<Message>,
-	) -> Self {
-		if let ToolMessage::Gradient(event) = event {
-			match (self, event) {
-				(_, GradientToolMessage::DocumentIsDirty) => {
-					while let Some(overlay) = tool_data.gradient_overlays.pop() {
-						overlay.delete_overlays(responses);
-					}
+	fn transition(self, event: ToolMessage, tool_data: &mut Self::ToolData, tool_action_data: &mut ToolActionHandlerData, tool_options: &Self::ToolOptions, responses: &mut VecDeque<Message>) -> Self {
+		let ToolActionHandlerData {
+			document, global_tool_data, input, ..
+		} = tool_action_data;
 
-					for path in document.selected_visible_layers() {
-						if !document.graphene_document.multiply_transforms(path).unwrap().inverse().is_finite() {
+		let ToolMessage::Gradient(event) = event else {
+			return self;
+		};
+
+		match (self, event) {
+			(_, GradientToolMessage::Overlays(mut overlay_context)) => {
+				let selected = tool_data.selected_gradient.as_ref();
+
+				for layer in document.selected_nodes.selected_visible_layers(document.metadata()) {
+					let Some(gradient) = get_gradient(layer, &document.network) else { continue };
+					let transform = gradient_space_transform(layer, document);
+					let dragging = selected
+						.filter(|selected| selected.layer.map_or(false, |selected_layer| selected_layer == layer))
+						.map(|selected| selected.dragging);
+
+					let Gradient { start, end, stops, .. } = gradient;
+					let (start, end) = (transform.transform_point2(start), transform.transform_point2(end));
+
+					overlay_context.line(start, end, None, None);
+					overlay_context.manipulator_handle(start, dragging == Some(GradientDragTarget::Start));
+					overlay_context.manipulator_handle(end, dragging == Some(GradientDragTarget::End));
+
+					for (index, (position, _)) in stops.0.into_iter().enumerate() {
+						if position.abs() < f64::EPSILON * 1000. || (1. - position).abs() < f64::EPSILON * 1000. {
 							continue;
 						}
-						let layer = document.graphene_document.layer(path).unwrap();
 
-						if let Ok(Fill::Gradient(gradient)) = layer.style().map(|style| style.fill()) {
-							let dragging = tool_data
-								.selected_gradient
-								.as_ref()
-								.and_then(|selected| if selected.path == path { Some(selected.dragging) } else { None });
-							tool_data.gradient_overlays.push(GradientOverlay::new(gradient, dragging, path, layer, document, responses, font_cache))
-						}
+						overlay_context.manipulator_handle(start.lerp(end, position), dragging == Some(GradientDragTarget::Step(index)));
 					}
-
-					self
 				}
-				(GradientToolFsmState::Ready, GradientToolMessage::PointerDown) => {
-					responses.push_back(BroadcastEvent::DocumentIsDirty.into());
+
+				self
+			}
+			(GradientToolFsmState::Ready, GradientToolMessage::DeleteStop) => {
+				let Some(selected_gradient) = &mut tool_data.selected_gradient else {
+					return self;
+				};
+
+				// Skip if invalid gradient
+				if selected_gradient.gradient.stops.0.len() < 2 {
+					return self;
+				}
+
+				// Remove the selected point
+				match selected_gradient.dragging {
+					GradientDragTarget::Start => selected_gradient.gradient.stops.0.remove(0),
+					GradientDragTarget::End => selected_gradient.gradient.stops.0.pop().unwrap(),
+					GradientDragTarget::Step(index) => selected_gradient.gradient.stops.0.remove(index),
+				};
+
+				// The gradient has only one point and so should become a fill
+				if selected_gradient.gradient.stops.0.len() == 1 {
+					if let Some(layer) = selected_gradient.layer {
+						responses.add(GraphOperationMessage::FillSet {
+							layer,
+							fill: Fill::Solid(selected_gradient.gradient.stops.0[0].1),
+						});
+					}
+					return self;
+				}
+
+				// Find the minimum and maximum positions
+				let min_position = selected_gradient.gradient.stops.0.iter().map(|(pos, _)| *pos).reduce(f64::min).expect("No min");
+				let max_position = selected_gradient.gradient.stops.0.iter().map(|(pos, _)| *pos).reduce(f64::max).expect("No max");
+
+				// Recompute the start and end position of the gradient (in viewport transform)
+				let transform = selected_gradient.transform;
+				let (start, end) = (transform.transform_point2(selected_gradient.gradient.start), transform.transform_point2(selected_gradient.gradient.end));
+				let (new_start, new_end) = (start.lerp(end, min_position), start.lerp(end, max_position));
+				selected_gradient.gradient.start = transform.inverse().transform_point2(new_start);
+				selected_gradient.gradient.end = transform.inverse().transform_point2(new_end);
+
+				// Remap the positions
+				for (position, _) in selected_gradient.gradient.stops.0.iter_mut() {
+					*position = (*position - min_position) / (max_position - min_position);
+				}
+
+				// Render the new gradient
+				selected_gradient.render_gradient(responses);
+
+				self
+			}
+			(_, GradientToolMessage::InsertStop) => {
+				for layer in document.selected_nodes.selected_visible_layers(document.metadata()) {
+					let Some(mut gradient) = get_gradient(layer, &document.network) else { continue };
+					let transform = gradient_space_transform(layer, document);
 
 					let mouse = input.mouse.position;
-					let tolerance = MANIPULATOR_GROUP_MARKER_SIZE.powi(2);
+					let (start, end) = (transform.transform_point2(gradient.start), transform.transform_point2(gradient.end));
 
-					let mut dragging = false;
-					for overlay in &tool_data.gradient_overlays {
-						// Check for dragging step
-						for (index, (pos, _)) in overlay.gradient.positions.iter().enumerate() {
-							let pos = overlay.transform.transform_point2(overlay.gradient.start.lerp(overlay.gradient.end, *pos));
-							if pos.distance_squared(mouse) < tolerance {
-								dragging = true;
-								tool_data.selected_gradient = Some(SelectedGradient {
-									path: overlay.path.clone(),
-									transform: overlay.transform,
-									gradient: overlay.gradient.clone(),
-									dragging: GradientDragTarget::Step(index),
-								})
-							}
-						}
+					// Compute the distance from the mouse to the gradient line in viewport space
+					let distance = (end - start).angle_between(mouse - start).sin() * (mouse - start).length();
 
-						// Check dragging start or end handle
-						for (pos, dragging_target) in [
-							(overlay.evaluate_gradient_start(), GradientDragTarget::Start),
-							(overlay.evaluate_gradient_end(), GradientDragTarget::End),
-						] {
-							if pos.distance_squared(mouse) < tolerance {
-								dragging = true;
-								start_snap(&mut tool_data.snap_manager, document, font_cache);
-								tool_data.selected_gradient = Some(SelectedGradient {
-									path: overlay.path.clone(),
-									transform: overlay.transform,
-									gradient: overlay.gradient.clone(),
-									dragging: dragging_target,
-								})
-							}
+					// If click is on the line then insert point
+					if distance < (SELECTION_THRESHOLD * 2.) {
+						// Try and insert the new stop
+						if let Some(index) = gradient.insert_stop(mouse, transform) {
+							document.backup_nonmut(responses);
+
+							let mut selected_gradient = SelectedGradient::new(gradient, layer, document);
+
+							// Select the new point
+							selected_gradient.dragging = GradientDragTarget::Step(index);
+
+							// Update the layer fill
+							selected_gradient.render_gradient(responses);
+
+							tool_data.selected_gradient = Some(selected_gradient);
+
+							break;
 						}
 					}
-					if dragging {
-						GradientToolFsmState::Drawing
-					} else {
-						let tolerance = DVec2::splat(SELECTION_TOLERANCE);
-						let quad = Quad::from_box([input.mouse.position - tolerance, input.mouse.position + tolerance]);
-						let intersection = document.graphene_document.intersects_quad_root(quad, font_cache).pop();
+				}
 
-						if let Some(intersection) = intersection {
-							if !document.selected_layers_contains(&intersection) {
-								let replacement_selected_layers = vec![intersection.clone()];
+				self
+			}
+			(GradientToolFsmState::Ready, GradientToolMessage::PointerDown) => {
+				let mouse = input.mouse.position;
+				tool_data.drag_start = mouse;
+				let tolerance = (MANIPULATOR_GROUP_MARKER_SIZE * 2.).powi(2);
 
-								responses.push_back(DocumentMessage::SetSelectedLayers { replacement_selected_layers }.into());
-							}
+				let mut dragging = false;
+				for layer in document.selected_nodes.selected_visible_layers(document.metadata()) {
+					let Some(gradient) = get_gradient(layer, &document.network) else { continue };
+					let transform = gradient_space_transform(layer, document);
 
-							let layer = document.graphene_document.layer(&intersection).unwrap();
+					// Check for dragging step
+					for (index, (pos, _)) in gradient.stops.0.iter().enumerate() {
+						let pos = transform.transform_point2(gradient.start.lerp(gradient.end, *pos));
+						if pos.distance_squared(mouse) < tolerance {
+							dragging = true;
+							tool_data.selected_gradient = Some(SelectedGradient {
+								layer: Some(layer),
+								transform,
+								gradient: gradient.clone(),
+								dragging: GradientDragTarget::Step(index),
+							})
+						}
+					}
 
-							let gradient = Gradient::new(
+					// Check dragging start or end handle
+					for (pos, dragging_target) in [(gradient.start, GradientDragTarget::Start), (gradient.end, GradientDragTarget::End)] {
+						let pos = transform.transform_point2(pos);
+						if pos.distance_squared(mouse) < tolerance {
+							dragging = true;
+							tool_data.selected_gradient = Some(SelectedGradient {
+								layer: Some(layer),
+								transform,
+								gradient: gradient.clone(),
+								dragging: dragging_target,
+							})
+						}
+					}
+				}
+				if dragging {
+					document.backup_nonmut(responses);
+					GradientToolFsmState::Drawing
+				} else {
+					let selected_layer = document.click(input.mouse.position, &document.network);
+
+					// Apply the gradient to the selected layer
+					if let Some(layer) = selected_layer {
+						if !document.selected_nodes.selected_layers_contains(layer, document.metadata()) {
+							let nodes = vec![layer.to_node()];
+
+							responses.add(NodeGraphMessage::SelectedNodesSet { nodes });
+						}
+
+						responses.add(DocumentMessage::StartTransaction);
+
+						// Use the already existing gradient if it exists
+						let gradient = if let Some(gradient) = get_gradient(layer, &document.network) {
+							gradient.clone()
+						} else {
+							// Generate a new gradient
+							Gradient::new(
 								DVec2::ZERO,
 								global_tool_data.secondary_color,
 								DVec2::ONE,
 								global_tool_data.primary_color,
 								DAffine2::IDENTITY,
-								generate_uuid(),
 								tool_options.gradient_type,
-							);
-							let mut selected_gradient = SelectedGradient::new(gradient, &intersection, layer, document, font_cache).with_gradient_start(input.mouse.position);
-							selected_gradient.update_gradient(input.mouse.position, responses, false, tool_options.gradient_type);
+							)
+						};
+						let selected_gradient = SelectedGradient::new(gradient, layer, document).with_gradient_start(input.mouse.position);
 
-							tool_data.selected_gradient = Some(selected_gradient);
+						tool_data.selected_gradient = Some(selected_gradient);
 
-							start_snap(&mut tool_data.snap_manager, document, font_cache);
-
-							GradientToolFsmState::Drawing
-						} else {
-							GradientToolFsmState::Ready
-						}
+						GradientToolFsmState::Drawing
+					} else {
+						GradientToolFsmState::Ready
 					}
 				}
-				(GradientToolFsmState::Drawing, GradientToolMessage::PointerMove { constrain_axis }) => {
-					if let Some(selected_gradient) = &mut tool_data.selected_gradient {
-						let mouse = tool_data.snap_manager.snap_position(responses, document, input.mouse.position);
-						selected_gradient.update_gradient(mouse, responses, input.keyboard.get(constrain_axis as usize), selected_gradient.gradient.gradient_type);
-					}
-					GradientToolFsmState::Drawing
-				}
-
-				(GradientToolFsmState::Drawing, GradientToolMessage::PointerUp) => {
-					tool_data.snap_manager.cleanup(responses);
-
-					GradientToolFsmState::Ready
-				}
-
-				(_, GradientToolMessage::Abort) => {
-					tool_data.snap_manager.cleanup(responses);
-
-					while let Some(overlay) = tool_data.gradient_overlays.pop() {
-						overlay.delete_overlays(responses);
-					}
-					GradientToolFsmState::Ready
-				}
-				_ => self,
 			}
-		} else {
-			self
+			(GradientToolFsmState::Drawing, GradientToolMessage::PointerMove { constrain_axis }) => {
+				if let Some(selected_gradient) = &mut tool_data.selected_gradient {
+					let mouse = input.mouse.position; // tool_data.snap_manager.snap_position(responses, document, input.mouse.position);
+					selected_gradient.update_gradient(mouse, responses, input.keyboard.get(constrain_axis as usize), selected_gradient.gradient.gradient_type);
+				}
+
+				// Auto-panning
+				let messages = [
+					GradientToolMessage::PointerOutsideViewport { constrain_axis }.into(),
+					GradientToolMessage::PointerMove { constrain_axis }.into(),
+				];
+				tool_data.auto_panning.setup_by_mouse_position(input, &messages, responses);
+
+				GradientToolFsmState::Drawing
+			}
+			(GradientToolFsmState::Drawing, GradientToolMessage::PointerOutsideViewport { .. }) => {
+				// Auto-panning
+				if let Some(shift) = tool_data.auto_panning.shift_viewport(input, responses) {
+					if let Some(selected_gradient) = &mut tool_data.selected_gradient {
+						selected_gradient.transform.translation += shift;
+					}
+				}
+
+				GradientToolFsmState::Drawing
+			}
+			(state, GradientToolMessage::PointerOutsideViewport { constrain_axis }) => {
+				// Auto-panning
+				let messages = [
+					GradientToolMessage::PointerOutsideViewport { constrain_axis }.into(),
+					GradientToolMessage::PointerMove { constrain_axis }.into(),
+				];
+				tool_data.auto_panning.stop(&messages, responses);
+
+				state
+			}
+			(GradientToolFsmState::Drawing, GradientToolMessage::PointerUp) => {
+				input.mouse.finish_transaction(tool_data.drag_start, responses);
+				tool_data.snap_manager.cleanup(responses);
+
+				GradientToolFsmState::Ready
+			}
+
+			(GradientToolFsmState::Drawing, GradientToolMessage::Abort) => {
+				responses.add(DocumentMessage::AbortTransaction);
+				tool_data.snap_manager.cleanup(responses);
+				responses.add(OverlaysMessage::Draw);
+
+				GradientToolFsmState::Ready
+			}
+			(_, GradientToolMessage::Abort) => GradientToolFsmState::Ready,
+			_ => self,
 		}
 	}
 
 	fn update_hints(&self, responses: &mut VecDeque<Message>) {
 		let hint_data = match self {
 			GradientToolFsmState::Ready => HintData(vec![HintGroup(vec![
-				HintInfo {
-					key_groups: vec![],
-					key_groups_mac: None,
-					mouse: Some(MouseMotion::LmbDrag),
-					label: String::from("Draw Gradient"),
-					plus: false,
-				},
-				HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Shift])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("Snap 15°"),
-					plus: true,
-				},
+				HintInfo::mouse(MouseMotion::LmbDrag, "Draw Gradient"),
+				HintInfo::keys([Key::Shift], "Snap 15°").prepend_plus(),
 			])]),
-			GradientToolFsmState::Drawing => HintData(vec![HintGroup(vec![HintInfo {
-				key_groups: vec![KeysGroup(vec![Key::Shift])],
-				key_groups_mac: None,
-				mouse: None,
-				label: String::from("Snap 15°"),
-				plus: false,
-			}])]),
+			GradientToolFsmState::Drawing => HintData(vec![
+				HintGroup(vec![HintInfo::mouse(MouseMotion::Rmb, ""), HintInfo::keys([Key::Escape], "Cancel").prepend_slash()]),
+				HintGroup(vec![HintInfo::keys([Key::Shift], "Snap 15°")]),
+			]),
 		};
 
-		responses.push_back(FrontendMessage::UpdateInputHints { hint_data }.into());
+		responses.add(FrontendMessage::UpdateInputHints { hint_data });
 	}
 
 	fn update_cursor(&self, responses: &mut VecDeque<Message>) {
-		responses.push_back(FrontendMessage::UpdateMouseCursor { cursor: MouseCursorIcon::Default }.into());
+		responses.add(FrontendMessage::UpdateMouseCursor { cursor: MouseCursorIcon::Default });
 	}
 }

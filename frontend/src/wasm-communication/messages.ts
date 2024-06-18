@@ -1,11 +1,10 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /* eslint-disable max-classes-per-file */
 
 import { Transform, Type, plainToClass } from "class-transformer";
 
-import { type IconName, type IconSize } from "@/utility-functions/icons";
-import { type WasmEditorInstance, type WasmRawInstance } from "@/wasm-communication/editor";
-
-import type MenuList from "@/components/floating-menus/MenuList.vue";
+import { type PopoverButtonStyle, type IconName, type IconSize } from "@graphite/utility-functions/icons";
+import { type EditorHandle } from "@graphite-frontend/wasm/pkg/graphite_wasm.js";
 
 export class JsMessage {
 	// The marker provides a way to check if an object is a sub-class constructor for a jsMessage.
@@ -13,7 +12,7 @@ export class JsMessage {
 }
 
 const TupleToVec2 = Transform(({ value }: { value: [number, number] | undefined }) => (value === undefined ? undefined : { x: value[0], y: value[1] }));
-const BigIntTupleToVec2 = Transform(({ value }: { value: [bigint, bigint] | undefined }) => (value === undefined ? undefined : { x: Number(value[0]), y: Number(value[1]) }));
+// const BigIntTupleToVec2 = Transform(({ value }: { value: [bigint, bigint] | undefined }) => (value === undefined ? undefined : { x: Number(value[0]), y: Number(value[1]) }));
 
 export type XY = { x: number; y: number };
 
@@ -26,25 +25,74 @@ export type XY = { x: number; y: number };
 // for details about how to transform the JSON from wasm-bindgen into classes.
 // ============================================================================
 
+export class UpdateBox extends JsMessage {
+	readonly box!: Box | undefined;
+}
+
+const ContextTupleToVec2 = Transform((data) => {
+	if (data.obj.contextMenuInformation === undefined) return undefined;
+	const contextMenuCoordinates = { x: data.obj.contextMenuInformation.contextMenuCoordinates[0], y: data.obj.contextMenuInformation.contextMenuCoordinates[1] };
+	let contextMenuData = data.obj.contextMenuInformation.contextMenuData;
+	if (contextMenuData.ToggleLayer !== undefined) {
+		contextMenuData = { nodeId: contextMenuData.ToggleLayer.nodeId, currentlyIsNode: contextMenuData.ToggleLayer.currentlyIsNode };
+	}
+	return { contextMenuCoordinates, contextMenuData };
+});
+
+export class UpdateContextMenuInformation extends JsMessage {
+	@ContextTupleToVec2
+	readonly contextMenuInformation!: ContextMenuInformation | undefined;
+}
+const LayerWidths = Transform(({ obj }) => obj.layerWidths);
+
+export class UpdateLayerWidths extends JsMessage {
+	@LayerWidths
+	readonly layerWidths!: Map<bigint, number>;
+}
+
 export class UpdateNodeGraph extends JsMessage {
 	@Type(() => FrontendNode)
 	readonly nodes!: FrontendNode[];
 
-	@Type(() => FrontendNodeLink)
-	readonly links!: FrontendNodeLink[];
+	@Type(() => FrontendNodeWire)
+	readonly wires!: FrontendNodeWire[];
 }
+
+export class UpdateNodeGraphTransform extends JsMessage {
+	readonly transform!: NodeGraphTransform;
+}
+
 export class UpdateNodeTypes extends JsMessage {
 	@Type(() => FrontendNode)
 	readonly nodeTypes!: FrontendNodeType[];
 }
 
-export class UpdateNodeGraphVisibility extends JsMessage {
-	readonly visible!: boolean;
+export class UpdateNodeThumbnail extends JsMessage {
+	readonly id!: bigint;
+
+	readonly value!: string;
+}
+
+export class UpdateNodeGraphSelection extends JsMessage {
+	@Type(() => BigInt)
+	readonly selected!: bigint[];
 }
 
 export class UpdateOpenDocumentsList extends JsMessage {
 	@Type(() => FrontendDocumentDetails)
 	readonly openDocuments!: FrontendDocumentDetails[];
+}
+
+export class UpdateSubgraphPath extends JsMessage {
+	readonly subgraphPath!: string[];
+}
+
+export class UpdateWirePathInProgress extends JsMessage {
+	readonly wirePath!: WirePath | undefined;
+}
+
+export class UpdateZoomWithScroll extends JsMessage {
+	readonly zoomWithScroll!: boolean;
 }
 
 // Allows the auto save system to use a string for the id rather than a BigInt.
@@ -69,41 +117,110 @@ export class FrontendDocumentDetails extends DocumentDetails {
 	readonly id!: bigint;
 }
 
-export type FrontendGraphDataType = "general" | "raster" | "color" | "vector" | "number";
+export class Box {
+	readonly startX!: number;
 
-export class NodeGraphInput {
+	readonly startY!: number;
+
+	readonly endX!: number;
+
+	readonly endY!: number;
+}
+
+export type ContextMenuInformation = {
+	contextMenuCoordinates: XY;
+
+	contextMenuData: "CreateNode" | { nodeId: bigint; currentlyIsNode: boolean };
+};
+
+export type FrontendGraphDataType = "General" | "Raster" | "VectorData" | "Number" | "Graphic" | "Artboard";
+
+export class FrontendGraphInput {
 	readonly dataType!: FrontendGraphDataType;
 
 	readonly name!: string;
+
+	readonly resolvedType!: string | undefined;
+
+	readonly connected!: bigint | undefined;
+}
+
+export class FrontendGraphOutput {
+	readonly dataType!: FrontendGraphDataType;
+
+	readonly name!: string;
+
+	readonly resolvedType!: string | undefined;
+
+	readonly connected!: bigint[];
+
+	readonly connectedIndex!: bigint[];
 }
 
 export class FrontendNode {
+	readonly isLayer!: boolean;
+
+	readonly canBeLayer!: boolean;
+
 	readonly id!: bigint;
 
-	readonly displayName!: string;
+	readonly alias!: string;
 
-	readonly primaryInput!: FrontendGraphDataType | undefined;
+	readonly name!: string;
 
-	readonly exposedInputs!: NodeGraphInput[];
+	readonly primaryInput!: FrontendGraphInput | undefined;
 
-	readonly outputs!: FrontendGraphDataType[];
+	readonly exposedInputs!: FrontendGraphInput[];
+
+	readonly primaryOutput!: FrontendGraphOutput | undefined;
+
+	readonly exposedOutputs!: FrontendGraphOutput[];
 
 	@TupleToVec2
 	readonly position!: XY | undefined;
+
+	//TODO: Store field for the width of the left node chain
+
+	readonly previewed!: boolean;
+
+	readonly visible!: boolean;
+
+	readonly unlocked!: boolean;
+
+	readonly errors!: string | undefined;
+
+	readonly uiOnly!: boolean;
 }
 
-export class FrontendNodeLink {
-	readonly linkStart!: bigint;
+export class FrontendNodeWire {
+	readonly wireStart!: bigint;
 
-	readonly linkEnd!: bigint;
+	readonly wireStartOutputIndex!: bigint;
 
-	readonly linkEndInputIndex!: bigint;
+	readonly wireEnd!: bigint;
+
+	readonly wireEndInputIndex!: bigint;
+
+	readonly dashed!: boolean;
 }
 
 export class FrontendNodeType {
 	readonly name!: string;
 
 	readonly category!: string;
+}
+
+export class NodeGraphTransform {
+	readonly scale!: number;
+	readonly x!: number;
+	readonly y!: number;
+}
+
+export class WirePath {
+	readonly pathString!: string;
+	readonly dataType!: FrontendGraphDataType;
+	readonly thick!: boolean;
+	readonly dashed!: boolean;
 }
 
 export class IndexedDbDocumentDetails extends DocumentDetails {
@@ -136,23 +253,25 @@ export type HintData = HintGroup[];
 export type HintGroup = HintInfo[];
 
 export class HintInfo {
-	readonly keyGroups!: KeysGroup[];
+	readonly keyGroups!: LayoutKeysGroup[];
 
-	readonly keyGroupsMac!: KeysGroup[] | undefined;
+	readonly keyGroupsMac!: LayoutKeysGroup[] | undefined;
 
 	readonly mouse!: MouseMotion | undefined;
 
 	readonly label!: string;
 
 	readonly plus!: boolean;
+
+	readonly slash!: boolean;
 }
 
 // Rust enum `Key`
 export type KeyRaw = string;
 // Serde converts a Rust `Key` enum variant into this format (via a custom serializer) with both the `Key` variant name (called `RawKey` in TS) and the localized `label` for the key
 export type Key = { key: KeyRaw; label: string };
-export type KeysGroup = Key[];
-export type ActionKeys = { keys: KeysGroup };
+export type LayoutKeysGroup = Key[];
+export type ActionKeys = { keys: LayoutKeysGroup };
 
 export type MouseMotion = string;
 
@@ -162,8 +281,62 @@ export type HSV = { h: number; s: number; v: number };
 export type RGBA = { r: number; g: number; b: number; a: number };
 export type RGB = { r: number; g: number; b: number };
 
+export class Gradient {
+	readonly stops!: { position: number; color: Color }[];
+
+	constructor(stops: { position: number; color: Color }[]) {
+		this.stops = stops;
+	}
+
+	toLinearGradientCSS(): string {
+		if (this.stops.length === 1) {
+			return `linear-gradient(to right, ${this.stops[0].color.toHexOptionalAlpha()} 0%, ${this.stops[0].color.toHexOptionalAlpha()} 100%)`;
+		}
+		const pieces = this.stops.map((stop) => `${stop.color.toHexOptionalAlpha()} ${stop.position * 100}%`);
+		return `linear-gradient(to right, ${pieces.join(", ")})`;
+	}
+
+	toLinearGradientCSSNoAlpha(): string {
+		if (this.stops.length === 1) {
+			return `linear-gradient(to right, ${this.stops[0].color.toHexNoAlpha()} 0%, ${this.stops[0].color.toHexNoAlpha()} 100%)`;
+		}
+		const pieces = this.stops.map((stop) => `${stop.color.toHexNoAlpha()} ${stop.position * 100}%`);
+		return `linear-gradient(to right, ${pieces.join(", ")})`;
+	}
+
+	firstColor(): Color | undefined {
+		return this.stops[0]?.color;
+	}
+
+	lastColor(): Color | undefined {
+		return this.stops[this.stops.length - 1]?.color;
+	}
+
+	atIndex(index: number): { position: number; color: Color } | undefined {
+		return this.stops[index];
+	}
+
+	colorAtIndex(index: number): Color | undefined {
+		return this.stops[index]?.color;
+	}
+
+	positionAtIndex(index: number): number | undefined {
+		return this.stops[index]?.position;
+	}
+}
+
 // All channels range from 0 to 1
 export class Color {
+	readonly red!: number;
+
+	readonly green!: number;
+
+	readonly blue!: number;
+
+	readonly alpha!: number;
+
+	readonly none!: boolean;
+
 	constructor();
 
 	constructor(none: "none");
@@ -211,16 +384,6 @@ export class Color {
 		}
 	}
 
-	readonly red!: number;
-
-	readonly green!: number;
-
-	readonly blue!: number;
-
-	readonly alpha!: number;
-
-	readonly none!: boolean;
-
 	static fromCSS(colorCode: string): Color | undefined {
 		// Allow single-digit hex value inputs
 		let colorValue = colorCode.trim();
@@ -256,6 +419,15 @@ export class Color {
 
 		const [r, g, b, a] = [...context.getImageData(0, 0, 1, 1).data];
 		return new Color(r / 255, g / 255, b / 255, a / 255);
+	}
+
+	equals(other: Color): boolean {
+		if (this.none && other.none) return true;
+		return Math.abs(this.red - other.red) < 1e-6 && Math.abs(this.green - other.green) < 1e-6 && Math.abs(this.blue - other.blue) < 1e-6 && Math.abs(this.alpha - other.alpha) < 1e-6;
+	}
+
+	lerp(other: Color, t: number): Color {
+		return new Color(this.red * (1 - t) + other.red * t, this.green * (1 - t) + other.green * t, this.blue * (1 - t) + other.blue * t, this.alpha * (1 - t) + other.alpha * t);
 	}
 
 	toHexNoAlpha(): string | undefined {
@@ -295,29 +467,18 @@ export class Color {
 		};
 	}
 
-	toRgba255(): RGBA | undefined {
-		if (this.none) return undefined;
-
-		return {
-			r: Math.round(this.red * 255),
-			g: Math.round(this.green * 255),
-			b: Math.round(this.blue * 255),
-			a: Math.round(this.alpha * 255),
-		};
-	}
-
 	toRgbCSS(): string | undefined {
-		const rgba = this.toRgba255();
-		if (!rgba) return undefined;
+		const rgb = this.toRgb255();
+		if (!rgb) return undefined;
 
-		return `rgb(${rgba.r}, ${rgba.g}, ${rgba.b})`;
+		return `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`;
 	}
 
 	toRgbaCSS(): string | undefined {
-		const rgba = this.toRgba255();
-		if (!rgba) return undefined;
+		const rgb = this.toRgb255();
+		if (!rgb) return undefined;
 
-		return `rgba(${rgba.r}, ${rgba.g}, ${rgba.b}, ${rgba.a})`;
+		return `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, ${this.alpha})`;
 	}
 
 	toHSV(): HSV | undefined {
@@ -405,25 +566,14 @@ export class UpdateActiveDocument extends JsMessage {
 
 export class DisplayDialogPanic extends JsMessage {
 	readonly panicInfo!: string;
-
-	readonly header!: string;
-
-	readonly description!: string;
 }
 
 export class DisplayDialog extends JsMessage {
+	readonly title!: string;
 	readonly icon!: IconName;
 }
 
 export class UpdateDocumentArtwork extends JsMessage {
-	readonly svg!: string;
-}
-
-export class UpdateDocumentOverlays extends JsMessage {
-	readonly svg!: string;
-}
-
-export class UpdateDocumentArtboards extends JsMessage {
 	readonly svg!: string;
 }
 
@@ -445,6 +595,8 @@ export class UpdateDocumentRulers extends JsMessage {
 	readonly spacing!: number;
 
 	readonly interval!: number;
+
+	readonly visible!: boolean;
 }
 
 export class UpdateEyedropperSamplingState extends JsMessage {
@@ -474,22 +626,22 @@ const mouseCursorIconCSSNames = {
 	Rotate: "custom-rotate",
 } as const;
 export type MouseCursor = keyof typeof mouseCursorIconCSSNames;
-export type MouseCursorIcon = typeof mouseCursorIconCSSNames[MouseCursor];
+export type MouseCursorIcon = (typeof mouseCursorIconCSSNames)[MouseCursor];
 
 export class UpdateMouseCursor extends JsMessage {
 	@Transform(({ value }: { value: MouseCursor }) => mouseCursorIconCSSNames[value] || "alias")
 	readonly cursor!: MouseCursorIcon;
 }
 
-export class TriggerFileDownload extends JsMessage {
-	readonly document!: string;
-
-	readonly name!: string;
-}
-
 export class TriggerLoadAutoSaveDocuments extends JsMessage {}
 
 export class TriggerLoadPreferences extends JsMessage {}
+
+export class TriggerFetchAndOpenDocument extends JsMessage {
+	readonly name!: string;
+
+	readonly filename!: string;
+}
 
 export class TriggerOpenDocument extends JsMessage {}
 
@@ -497,7 +649,17 @@ export class TriggerImport extends JsMessage {}
 
 export class TriggerPaste extends JsMessage {}
 
-export class TriggerRasterDownload extends JsMessage {
+export class TriggerCopyToClipboardBlobUrl extends JsMessage {
+	readonly blobUrl!: string;
+}
+
+export class TriggerDownloadBlobUrl extends JsMessage {
+	readonly layerName!: string;
+
+	readonly blobUrl!: string;
+}
+
+export class TriggerDownloadImage extends JsMessage {
 	readonly svg!: string;
 
 	readonly name!: string;
@@ -508,80 +670,10 @@ export class TriggerRasterDownload extends JsMessage {
 	readonly size!: XY;
 }
 
-export class TriggerImaginateCheckServerStatus extends JsMessage {
-	readonly hostname!: string;
-}
+export class TriggerDownloadTextFile extends JsMessage {
+	readonly document!: string;
 
-export class TriggerImaginateGenerate extends JsMessage {
-	@Type(() => ImaginateGenerationParameters)
-	readonly parameters!: ImaginateGenerationParameters;
-
-	@Type(() => ImaginateBaseImage)
-	readonly baseImage!: ImaginateBaseImage | undefined;
-
-	@Type(() => ImaginateBaseImage)
-	readonly maskImage: ImaginateBaseImage | undefined;
-
-	readonly maskPaintMode!: string;
-
-	readonly maskBlurPx!: number;
-
-	readonly maskFillContent!: string;
-
-	readonly hostname!: string;
-
-	readonly refreshFrequency!: number;
-
-	readonly documentId!: bigint;
-
-	readonly layerPath!: BigUint64Array;
-}
-
-export class ImaginateBaseImage {
-	readonly svg!: string;
-
-	readonly size!: [number, number];
-}
-
-export class ImaginateGenerationParameters {
-	readonly seed!: number;
-
-	readonly samples!: number;
-
-	readonly samplingMethod!: string;
-
-	readonly denoisingStrength!: number | undefined;
-
-	readonly cfgScale!: number;
-
-	readonly prompt!: string;
-
-	readonly negativePrompt!: string;
-
-	@BigIntTupleToVec2
-	readonly resolution!: XY;
-
-	readonly restoreFaces!: boolean;
-
-	readonly tiling!: boolean;
-}
-
-export class TriggerImaginateTerminate extends JsMessage {
-	readonly documentId!: bigint;
-
-	readonly layerPath!: BigUint64Array;
-
-	readonly hostname!: string;
-}
-
-export class TriggerNodeGraphFrameGenerate extends JsMessage {
-	readonly documentId!: bigint;
-
-	readonly layerPath!: BigUint64Array;
-
-	readonly svg!: string;
-
-	readonly size!: [number, number];
+	readonly name!: string;
 }
 
 export class TriggerRefreshBoundsOfViewports extends JsMessage {}
@@ -596,69 +688,13 @@ export class TriggerSavePreferences extends JsMessage {
 
 export class DocumentChanged extends JsMessage {}
 
-export class UpdateDocumentLayerTreeStructure extends JsMessage {
-	constructor(readonly layerId: bigint, readonly children: UpdateDocumentLayerTreeStructure[]) {
-		super();
-	}
-}
-
-type DataBuffer = {
+export type DataBuffer = {
 	pointer: bigint;
 	length: bigint;
 };
 
-export function newUpdateDocumentLayerTreeStructure(input: { dataBuffer: DataBuffer }, wasm: WasmRawInstance): UpdateDocumentLayerTreeStructure {
-	const pointerNum = Number(input.dataBuffer.pointer);
-	const lengthNum = Number(input.dataBuffer.length);
-
-	const wasmMemoryBuffer = wasm.wasmMemory().buffer;
-
-	// Decode the folder structure encoding
-	const encoding = new DataView(wasmMemoryBuffer, pointerNum, lengthNum);
-
-	// The structure section indicates how to read through the upcoming layer list and assign depths to each layer
-	const structureSectionLength = Number(encoding.getBigUint64(0, true));
-	const structureSectionMsbSigned = new DataView(wasmMemoryBuffer, pointerNum + 8, structureSectionLength * 8);
-
-	// The layer IDs section lists each layer ID sequentially in the tree, as it will show up in the panel
-	const layerIdsSection = new DataView(wasmMemoryBuffer, pointerNum + 8 + structureSectionLength * 8);
-
-	let layersEncountered = 0;
-	let currentFolder = new UpdateDocumentLayerTreeStructure(BigInt(-1), []);
-	const currentFolderStack = [currentFolder];
-
-	for (let i = 0; i < structureSectionLength; i += 1) {
-		const msbSigned = structureSectionMsbSigned.getBigUint64(i * 8, true);
-		const msbMask = BigInt(1) << BigInt(64 - 1);
-
-		// Set the MSB to 0 to clear the sign and then read the number as usual
-		const numberOfLayersAtThisDepth = msbSigned & ~msbMask;
-
-		// Store child folders in the current folder (until we are interrupted by an indent)
-		for (let j = 0; j < numberOfLayersAtThisDepth; j += 1) {
-			const layerId = layerIdsSection.getBigUint64(layersEncountered * 8, true);
-			layersEncountered += 1;
-
-			const childLayer = new UpdateDocumentLayerTreeStructure(layerId, []);
-			currentFolder.children.push(childLayer);
-		}
-
-		// Check the sign of the MSB, where a 1 is a negative (outward) indent
-		const subsequentDirectionOfDepthChange = (msbSigned & msbMask) === BigInt(0);
-		// Inward
-		if (subsequentDirectionOfDepthChange) {
-			currentFolderStack.push(currentFolder);
-			currentFolder = currentFolder.children[currentFolder.children.length - 1];
-		}
-		// Outward
-		else {
-			const popped = currentFolderStack.pop();
-			if (!popped) throw Error("Too many negative indents in the folder structure");
-			if (popped) currentFolder = popped;
-		}
-	}
-
-	return currentFolder;
+export class UpdateDocumentLayerStructureJs extends JsMessage {
+	readonly dataBuffer!: DataBuffer;
 }
 
 export class DisplayEditableTextbox extends JsMessage {
@@ -670,13 +706,14 @@ export class DisplayEditableTextbox extends JsMessage {
 
 	@Type(() => Color)
 	readonly color!: Color;
+
+	readonly url!: string;
+
+	readonly transform!: number[];
 }
 
-export class UpdateImageData extends JsMessage {
-	readonly documentId!: bigint;
-
-	@Type(() => ImaginateImageData)
-	readonly imageData!: ImaginateImageData[];
+export class DisplayEditableTextboxTransform extends JsMessage {
+	readonly transform!: number[];
 }
 
 export class DisplayRemoveEditableTextbox extends JsMessage {}
@@ -687,56 +724,33 @@ export class UpdateDocumentLayerDetails extends JsMessage {
 }
 
 export class LayerPanelEntry {
+	id!: bigint;
+
 	name!: string;
+
+	alias!: string;
 
 	@Transform(({ value }: { value: string }) => value || undefined)
 	tooltip!: string | undefined;
 
-	visible!: boolean;
+	childrenAllowed!: boolean;
 
-	layerType!: LayerType;
+	childrenPresent!: boolean;
 
-	@Transform(({ value }: { value: bigint[] }) => new BigUint64Array(value))
-	path!: BigUint64Array;
-
-	@Type(() => LayerMetadata)
-	layerMetadata!: LayerMetadata;
-
-	thumbnail!: string;
-}
-
-export class LayerMetadata {
 	expanded!: boolean;
 
-	selected!: boolean;
-}
+	@Transform(({ value }: { value: bigint }) => Number(value))
+	depth!: number;
 
-export type LayerType = "Imaginate" | "NodeGraphFrame" | "Folder" | "Image" | "Shape" | "Text";
+	visible!: boolean;
 
-export type LayerTypeData = {
-	name: string;
-	icon: IconName;
-};
+	parentsVisible!: boolean;
 
-export function layerTypeData(layerType: LayerType): LayerTypeData | undefined {
-	const entries: Record<string, LayerTypeData> = {
-		Imaginate: { name: "Imaginate", icon: "NodeImaginate" },
-		NodeGraphFrame: { name: "Node Graph Frame", icon: "NodeNodes" },
-		Folder: { name: "Folder", icon: "NodeFolder" },
-		Image: { name: "Image", icon: "NodeImage" },
-		Shape: { name: "Shape", icon: "NodeShape" },
-		Text: { name: "Text", icon: "NodeText" },
-	};
+	unlocked!: boolean;
 
-	return entries[layerType];
-}
+	parentsUnlocked!: boolean;
 
-export class ImaginateImageData {
-	readonly path!: BigUint64Array;
-
-	readonly mime!: string;
-
-	readonly imageData!: Uint8Array;
+	parentId!: bigint | undefined;
 }
 
 export class DisplayDialogDismiss extends JsMessage {}
@@ -752,6 +766,10 @@ export class TriggerFontLoad extends JsMessage {
 	font!: Font;
 
 	isDefault!: boolean;
+}
+
+export class TriggerGraphViewOverlay extends JsMessage {
+	open!: boolean;
 }
 
 export class TriggerVisitLink extends JsMessage {
@@ -773,7 +791,7 @@ export class TriggerViewportResize extends JsMessage {}
 // WIDGET PROPS
 
 export abstract class WidgetProps {
-	kind!: string;
+	kind!: WidgetPropsNames;
 }
 
 export class CheckboxInput extends WidgetProps {
@@ -787,19 +805,37 @@ export class CheckboxInput extends WidgetProps {
 	tooltip!: string | undefined;
 }
 
-export class ColorInput extends WidgetProps {
-	@Transform(({ value }: { value: { red: number; green: number; blue: number; alpha: number } | undefined }) =>
-		value === undefined ? new Color("none") : new Color(value.red, value.green, value.blue, value.alpha)
-	)
-	value!: Color;
+export class ColorButton extends WidgetProps {
+	@Transform(({ value }) => {
+		const gradient = value["Gradient"];
+		if (gradient) {
+			const stops = gradient.map(([position, color]: [number, color: { red: number; green: number; blue: number; alpha: number }]) => ({
+				position,
+				color: new Color(color.red, color.green, color.blue, color.alpha),
+			}));
+			return new Gradient(stops);
+		}
 
-	noTransparency!: boolean;
+		const solid = value["Solid"];
+		if (solid) {
+			return new Color(solid.red, solid.green, solid.blue, solid.alpha);
+		}
+
+		return new Color("none");
+	})
+	value!: FillChoice;
 
 	disabled!: boolean;
+
+	allowNone!: boolean;
+
+	// allowTransparency!: boolean; // TODO: Implement
 
 	@Transform(({ value }: { value: string }) => value || undefined)
 	tooltip!: string | undefined;
 }
+
+export type FillChoice = Color | Gradient;
 
 type MenuEntryCommon = {
 	label: string;
@@ -811,20 +847,40 @@ type MenuEntryCommon = {
 export type MenuBarEntry = MenuEntryCommon & {
 	action: Widget;
 	children?: MenuBarEntry[][];
+	disabled?: boolean;
 };
 
-// An entry in the all-encompassing MenuList component which defines all types of menus ranging from `MenuBarInput` to `DropdownInput` widgets
+// An entry in the all-encompassing MenuList component which defines all types of menus (which are spawned by widgets like `TextButton` and `DropdownInput`)
 export type MenuListEntry = MenuEntryCommon & {
 	action?: () => void;
 	children?: MenuListEntry[][];
 
+	value: string;
 	shortcutRequiresLock?: boolean;
-	value?: string;
 	disabled?: boolean;
 	tooltip?: string;
 	font?: URL;
-	ref?: InstanceType<typeof MenuList>;
 };
+
+export class CurveManipulatorGroup {
+	anchor!: [number, number];
+	handles!: [[number, number], [number, number]];
+}
+
+export class Curve {
+	manipulatorGroups!: CurveManipulatorGroup[];
+	firstHandle!: [number, number];
+	lastHandle!: [number, number];
+}
+
+export class CurveInput extends WidgetProps {
+	value!: Curve;
+
+	disabled!: boolean;
+
+	@Transform(({ value }: { value: string }) => value || undefined)
+	tooltip!: string | undefined;
+}
 
 export class DropdownInput extends WidgetProps {
 	entries!: MenuListEntry[][];
@@ -857,6 +913,8 @@ export class FontInput extends WidgetProps {
 export class IconButton extends WidgetProps {
 	icon!: IconName;
 
+	hoverIcon!: IconName | undefined;
+
 	size!: IconSize;
 
 	disabled!: boolean;
@@ -876,22 +934,17 @@ export class IconLabel extends WidgetProps {
 	tooltip!: string | undefined;
 }
 
-export class LayerReferenceInput extends WidgetProps {
-	@Transform(({ value }: { value: BigUint64Array | undefined }) => (value ? String(value) : undefined))
-	value!: string | undefined;
+export class ImageLabel extends WidgetProps {
+	image!: IconName;
 
-	layerName!: string | undefined;
+	@Transform(({ value }: { value: string }) => value || undefined)
+	width!: string | undefined;
 
-	layerType!: LayerType | undefined;
-
-	disabled!: boolean;
+	@Transform(({ value }: { value: string }) => value || undefined)
+	height!: string | undefined;
 
 	@Transform(({ value }: { value: string }) => value || undefined)
 	tooltip!: string | undefined;
-
-	// Styling
-
-	minWidth!: number;
 }
 
 export type NumberInputIncrementBehavior = "Add" | "Multiply" | "Callback" | "None";
@@ -944,29 +997,20 @@ export class NumberInput extends WidgetProps {
 	minWidth!: number;
 }
 
-export class OptionalInput extends WidgetProps {
-	checked!: boolean;
+export class PopoverButton extends WidgetProps {
+	style!: PopoverButtonStyle | undefined;
+
+	icon!: IconName | undefined;
 
 	disabled!: boolean;
-
-	icon!: IconName;
 
 	@Transform(({ value }: { value: string }) => value || undefined)
 	tooltip!: string | undefined;
-}
-
-export class PopoverButton extends WidgetProps {
-	icon!: string | undefined;
-
-	disabled!: boolean;
 
 	// Body
-	header!: string;
+	popoverLayout!: LayoutGroup[];
 
-	text!: string;
-
-	@Transform(({ value }: { value: string }) => value || undefined)
-	tooltip!: string | undefined;
+	popoverMinWidth: number | undefined;
 }
 
 export type RadioEntryData = {
@@ -985,11 +1029,13 @@ export class RadioInput extends WidgetProps {
 
 	disabled!: boolean;
 
-	selectedIndex!: number;
+	selectedIndex!: number | undefined;
+
+	minWidth!: number;
 }
 
 export type SeparatorDirection = "Horizontal" | "Vertical";
-export type SeparatorType = "Related" | "Unrelated" | "Section" | "List";
+export type SeparatorType = "Related" | "Unrelated" | "Section";
 
 export class Separator extends WidgetProps {
 	direction!: SeparatorDirection;
@@ -997,7 +1043,7 @@ export class Separator extends WidgetProps {
 	type!: SeparatorType;
 }
 
-export class SwatchPairInput extends WidgetProps {
+export class WorkingColorsInput extends WidgetProps {
 	@Type(() => Color)
 	primary!: Color;
 
@@ -1019,7 +1065,7 @@ export class TextAreaInput extends WidgetProps {
 export class ParameterExposeButton extends WidgetProps {
 	exposed!: boolean;
 
-	dataType!: string;
+	dataType!: FrontendGraphDataType;
 
 	@Transform(({ value }: { value: string }) => value || undefined)
 	tooltip!: string | undefined;
@@ -1028,9 +1074,13 @@ export class ParameterExposeButton extends WidgetProps {
 export class TextButton extends WidgetProps {
 	label!: string;
 
-	icon!: string | undefined;
+	icon!: IconName | undefined;
+
+	hoverIcon!: IconName | undefined;
 
 	emphasized!: boolean;
+
+	flush!: boolean;
 
 	minWidth!: number;
 
@@ -1038,6 +1088,8 @@ export class TextButton extends WidgetProps {
 
 	@Transform(({ value }: { value: string }) => value || undefined)
 	tooltip!: string | undefined;
+
+	menuListChildren!: MenuListEntry[][];
 }
 
 export type TextButtonWidget = {
@@ -1049,6 +1101,7 @@ export type TextButtonWidget = {
 		label: string;
 		icon?: IconName;
 		emphasized?: boolean;
+		flush?: boolean;
 		minWidth?: number;
 		disabled?: boolean;
 		tooltip?: string;
@@ -1057,6 +1110,15 @@ export type TextButtonWidget = {
 		// `action` is used via `IconButtonWidget.callback`
 	};
 };
+
+export class BreadcrumbTrailButtons extends WidgetProps {
+	labels!: string[];
+
+	disabled!: boolean;
+
+	@Transform(({ value }: { value: string }) => value || undefined)
+	tooltip!: string | undefined;
+}
 
 export class TextInput extends WidgetProps {
 	value!: string;
@@ -1094,7 +1156,7 @@ export class TextLabel extends WidgetProps {
 
 export type PivotPosition = "None" | "TopLeft" | "TopCenter" | "TopRight" | "CenterLeft" | "Center" | "CenterRight" | "BottomLeft" | "BottomCenter" | "BottomRight";
 
-export class PivotAssist extends WidgetProps {
+export class PivotInput extends WidgetProps {
 	position!: PivotPosition;
 
 	disabled!: boolean;
@@ -1103,27 +1165,37 @@ export class PivotAssist extends WidgetProps {
 // WIDGET
 
 const widgetSubTypes = [
+	{ value: BreadcrumbTrailButtons, name: "BreadcrumbTrailButtons" },
 	{ value: CheckboxInput, name: "CheckboxInput" },
-	{ value: ColorInput, name: "ColorInput" },
+	{ value: ColorButton, name: "ColorButton" },
+	{ value: CurveInput, name: "CurveInput" },
 	{ value: DropdownInput, name: "DropdownInput" },
 	{ value: FontInput, name: "FontInput" },
 	{ value: IconButton, name: "IconButton" },
 	{ value: IconLabel, name: "IconLabel" },
-	{ value: LayerReferenceInput, name: "LayerReferenceInput" },
+	{ value: ImageLabel, name: "ImageLabel" },
 	{ value: NumberInput, name: "NumberInput" },
-	{ value: OptionalInput, name: "OptionalInput" },
+	{ value: ParameterExposeButton, name: "ParameterExposeButton" },
+	{ value: PivotInput, name: "PivotInput" },
 	{ value: PopoverButton, name: "PopoverButton" },
 	{ value: RadioInput, name: "RadioInput" },
 	{ value: Separator, name: "Separator" },
-	{ value: SwatchPairInput, name: "SwatchPairInput" },
+	{ value: WorkingColorsInput, name: "WorkingColorsInput" },
 	{ value: TextAreaInput, name: "TextAreaInput" },
 	{ value: TextButton, name: "TextButton" },
-	{ value: ParameterExposeButton, name: "ParameterExposeButton" },
 	{ value: TextInput, name: "TextInput" },
 	{ value: TextLabel, name: "TextLabel" },
-	{ value: PivotAssist, name: "PivotAssist" },
-];
-export type WidgetPropsSet = InstanceType<typeof widgetSubTypes[number]["value"]>;
+] as const;
+
+type WidgetSubTypes = (typeof widgetSubTypes)[number];
+type WidgetKindMap = { [T in WidgetSubTypes as T["name"]]: InstanceType<T["value"]> };
+export type WidgetPropsNames = keyof WidgetKindMap;
+export type WidgetPropsSet = WidgetKindMap[WidgetPropsNames];
+
+export function narrowWidgetProps<K extends WidgetPropsNames>(props: WidgetPropsSet, kind: K) {
+	if (props.kind === kind) return props as WidgetKindMap[K];
+	else return undefined;
+}
 
 export class Widget {
 	constructor(props: WidgetPropsSet, widgetId: bigint) {
@@ -1131,24 +1203,30 @@ export class Widget {
 		this.widgetId = widgetId;
 	}
 
-	@Type(() => WidgetProps, { discriminator: { property: "kind", subTypes: widgetSubTypes }, keepDiscriminatorProperty: true })
+	@Type(() => WidgetProps, { discriminator: { property: "kind", subTypes: [...widgetSubTypes] }, keepDiscriminatorProperty: true })
 	props!: WidgetPropsSet;
 
 	widgetId!: bigint;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+function hoistWidgetHolder(widgetHolder: any): Widget {
+	const kind = Object.keys(widgetHolder.widget)[0];
+	const props = widgetHolder.widget[kind];
+	props.kind = kind;
+
+	if (kind === "PopoverButton") {
+		props.popoverLayout = props.popoverLayout.map(createLayoutGroup);
+	}
+
+	const { widgetId } = widgetHolder;
+
+	return plainToClass(Widget, { props, widgetId });
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function hoistWidgetHolders(widgetHolders: any[]): Widget[] {
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	return widgetHolders.map((widgetHolder: any) => {
-		const kind = Object.keys(widgetHolder.widget)[0];
-		const props = widgetHolder.widget[kind];
-		props.kind = kind;
-
-		const { widgetId } = widgetHolder;
-
-		return plainToClass(Widget, { props, widgetId });
-	});
+	return widgetHolders.map(hoistWidgetHolder);
 }
 
 // WIDGET LAYOUT
@@ -1158,6 +1236,18 @@ export type WidgetLayout = {
 	layout: LayoutGroup[];
 };
 
+export class WidgetDiffUpdate extends JsMessage {
+	layoutTarget!: unknown;
+
+	// TODO: Replace `any` with correct typing
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	@Transform(({ value }: { value: any }) => createWidgetDiff(value))
+	diff!: WidgetDiff[];
+}
+
+type UIItem = LayoutGroup[] | LayoutGroup | Widget | MenuBarEntry[] | MenuBarEntry;
+type WidgetDiff = { widgetPath: number[]; newValue: UIItem };
+
 export function defaultWidgetLayout(): WidgetLayout {
 	return {
 		layoutTarget: undefined,
@@ -1165,136 +1255,118 @@ export function defaultWidgetLayout(): WidgetLayout {
 	};
 }
 
-export type LayoutGroup = WidgetRow | WidgetColumn | WidgetSection;
+// Updates a widget layout based on a list of updates, giving the new layout by mutating the `layout` argument
+export function patchWidgetLayout(layout: /* &mut */ WidgetLayout, updates: WidgetDiffUpdate) {
+	layout.layoutTarget = updates.layoutTarget;
 
-export type WidgetColumn = { columnWidgets: Widget[] };
-export function isWidgetColumn(layoutColumn: LayoutGroup): layoutColumn is WidgetColumn {
-	return Boolean((layoutColumn as WidgetColumn).columnWidgets);
+	updates.diff.forEach((update) => {
+		// Find the object where the diff applies to
+		const diffObject = update.widgetPath.reduce((targetLayout, index) => {
+			if ("columnWidgets" in targetLayout) return targetLayout.columnWidgets[index];
+			if ("rowWidgets" in targetLayout) return targetLayout.rowWidgets[index];
+			if ("layout" in targetLayout) return targetLayout.layout[index];
+			if (targetLayout instanceof Widget) {
+				if (targetLayout.props.kind === "PopoverButton" && targetLayout.props instanceof PopoverButton && targetLayout.props.popoverLayout) {
+					return targetLayout.props.popoverLayout[index];
+				}
+				// eslint-disable-next-line no-console
+				console.error("Tried to index widget");
+				return targetLayout;
+			}
+			// This is a path traversal so we can assume from the backend that it exists
+			// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+			if ("action" in targetLayout) return targetLayout.children![index];
+			return targetLayout[index];
+		}, layout.layout as UIItem);
+
+		// If this is a list with a length, then set the length to 0 to clear the list
+		if ("length" in diffObject) {
+			diffObject.length = 0;
+		}
+		// Remove all of the keys from the old object
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		Object.keys(diffObject).forEach((key) => delete (diffObject as any)[key]);
+
+		// Assign keys to the new object
+		// `Object.assign` works but `diffObject = update.newValue;` doesn't.
+		// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object/assign
+		Object.assign(diffObject, update.newValue);
+	});
 }
 
-export type WidgetRow = { rowWidgets: Widget[] };
-export function isWidgetRow(layoutRow: LayoutGroup): layoutRow is WidgetRow {
-	return Boolean((layoutRow as WidgetRow).rowWidgets);
+export type LayoutGroup = WidgetSpanRow | WidgetSpanColumn | WidgetSection;
+
+export type WidgetSpanColumn = { columnWidgets: Widget[] };
+export function isWidgetSpanColumn(layoutColumn: LayoutGroup): layoutColumn is WidgetSpanColumn {
+	return Boolean((layoutColumn as WidgetSpanColumn)?.columnWidgets);
 }
 
-export type WidgetSection = { name: string; layout: LayoutGroup[] };
+export type WidgetSpanRow = { rowWidgets: Widget[] };
+export function isWidgetSpanRow(layoutRow: LayoutGroup): layoutRow is WidgetSpanRow {
+	return Boolean((layoutRow as WidgetSpanRow)?.rowWidgets);
+}
+
+export type WidgetSection = { name: string; visible: boolean; id: bigint; layout: LayoutGroup[] };
 export function isWidgetSection(layoutRow: LayoutGroup): layoutRow is WidgetSection {
-	return Boolean((layoutRow as WidgetSection).layout);
+	return Boolean((layoutRow as WidgetSection)?.layout);
 }
 
 // Unpacking rust types to more usable type in the frontend
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function createWidgetLayout(widgetLayout: any[]): LayoutGroup[] {
-	return widgetLayout.map((layoutType): LayoutGroup => {
-		if (layoutType.column) {
-			const columnWidgets = hoistWidgetHolders(layoutType.column.columnWidgets);
-
-			const result: WidgetColumn = { columnWidgets };
-			return result;
+function createWidgetDiff(diffs: any[]): WidgetDiff[] {
+	return diffs.map((diff) => {
+		const { widgetPath, newValue } = diff;
+		if (newValue.subLayout) {
+			return { widgetPath, newValue: newValue.subLayout.map(createLayoutGroup) };
 		}
-
-		if (layoutType.row) {
-			const rowWidgets = hoistWidgetHolders(layoutType.row.rowWidgets);
-
-			const result: WidgetRow = { rowWidgets };
-			return result;
+		if (newValue.layoutGroup) {
+			return { widgetPath, newValue: createLayoutGroup(newValue.layoutGroup) };
 		}
-
-		if (layoutType.section) {
-			const { name } = layoutType.section;
-			const layout = createWidgetLayout(layoutType.section.layout);
-
-			const result: WidgetSection = { name, layout };
-			return result;
+		if (newValue.widget) {
+			return { widgetPath, newValue: hoistWidgetHolder(newValue.widget) };
 		}
-
-		throw new Error("Layout row type does not exist");
+		// This code should be unreachable
+		throw new Error("DiffUpdate invalid");
 	});
 }
 
+// Unpacking a layout group
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function createLayoutGroup(layoutGroup: any): LayoutGroup {
+	if (layoutGroup.column) {
+		const columnWidgets = hoistWidgetHolders(layoutGroup.column.columnWidgets);
+
+		const result: WidgetSpanColumn = { columnWidgets };
+		return result;
+	}
+
+	if (layoutGroup.row) {
+		const result: WidgetSpanRow = { rowWidgets: hoistWidgetHolders(layoutGroup.row.rowWidgets) };
+		return result;
+	}
+
+	if (layoutGroup.section) {
+		const result: WidgetSection = { name: layoutGroup.section.name, visible: layoutGroup.section.visible, id: layoutGroup.section.id, layout: layoutGroup.section.layout.map(createLayoutGroup) };
+		return result;
+	}
+
+	throw new Error("Layout row type does not exist");
+}
+
 // WIDGET LAYOUTS
+export class UpdateDialogButtons extends WidgetDiffUpdate {}
 
-export class UpdateDialogDetails extends JsMessage implements WidgetLayout {
-	layoutTarget!: unknown;
+export class UpdateDialogColumn1 extends WidgetDiffUpdate {}
 
-	// TODO: Replace `any` with correct typing
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	@Transform(({ value }: { value: any }) => createWidgetLayout(value))
-	layout!: LayoutGroup[];
-}
+export class UpdateDialogColumn2 extends WidgetDiffUpdate {}
 
-export class UpdateDocumentModeLayout extends JsMessage implements WidgetLayout {
-	layoutTarget!: unknown;
+export class UpdateDocumentBarLayout extends WidgetDiffUpdate {}
 
-	// TODO: Replace `any` with correct typing
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	@Transform(({ value }: { value: any }) => createWidgetLayout(value))
-	layout!: LayoutGroup[];
-}
+export class UpdateDocumentModeLayout extends WidgetDiffUpdate {}
 
-export class UpdateToolOptionsLayout extends JsMessage implements WidgetLayout {
-	layoutTarget!: unknown;
+export class UpdateLayersPanelOptionsLayout extends WidgetDiffUpdate {}
 
-	// TODO: Replace `any` with correct typing
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	@Transform(({ value }: { value: any }) => createWidgetLayout(value))
-	layout!: LayoutGroup[];
-}
-
-export class UpdateDocumentBarLayout extends JsMessage implements WidgetLayout {
-	layoutTarget!: unknown;
-
-	// TODO: Replace `any` with correct typing
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	@Transform(({ value }: { value: any }) => createWidgetLayout(value))
-	layout!: LayoutGroup[];
-}
-
-export class UpdateToolShelfLayout extends JsMessage implements WidgetLayout {
-	layoutTarget!: unknown;
-
-	// TODO: Replace `any` with correct typing
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	@Transform(({ value }: { value: any }) => createWidgetLayout(value))
-	layout!: LayoutGroup[];
-}
-
-export class UpdateWorkingColorsLayout extends JsMessage implements WidgetLayout {
-	layoutTarget!: unknown;
-
-	// TODO: Replace `any` with correct typing
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	@Transform(({ value }: { value: any }) => createWidgetLayout(value))
-	layout!: LayoutGroup[];
-}
-
-export class UpdatePropertyPanelOptionsLayout extends JsMessage implements WidgetLayout {
-	layoutTarget!: unknown;
-
-	// TODO: Replace `any` with correct typing
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	@Transform(({ value }: { value: any }) => createWidgetLayout(value))
-	layout!: LayoutGroup[];
-}
-
-export class UpdatePropertyPanelSectionsLayout extends JsMessage implements WidgetLayout {
-	layoutTarget!: unknown;
-
-	// TODO: Replace `any` with correct typing
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	@Transform(({ value }: { value: any }) => createWidgetLayout(value))
-	layout!: LayoutGroup[];
-}
-
-export class UpdateLayerTreeOptionsLayout extends JsMessage implements WidgetLayout {
-	layoutTarget!: unknown;
-
-	// TODO: Replace `any` with correct typing
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	@Transform(({ value }: { value: any }) => createWidgetLayout(value))
-	layout!: LayoutGroup[];
-}
-
+// Extends JsMessage instead of WidgetDiffUpdate because the menu bar isn't diffed
 export class UpdateMenuBarLayout extends JsMessage {
 	layoutTarget!: unknown;
 
@@ -1303,6 +1375,18 @@ export class UpdateMenuBarLayout extends JsMessage {
 	@Transform(({ value }: { value: any }) => createMenuLayout(value))
 	layout!: MenuBarEntry[];
 }
+
+export class UpdateNodeGraphBarLayout extends WidgetDiffUpdate {}
+
+export class UpdatePropertyPanelOptionsLayout extends WidgetDiffUpdate {}
+
+export class UpdatePropertyPanelSectionsLayout extends WidgetDiffUpdate {}
+
+export class UpdateToolOptionsLayout extends WidgetDiffUpdate {}
+
+export class UpdateToolShelfLayout extends WidgetDiffUpdate {}
+
+export class UpdateWorkingColorsLayout extends WidgetDiffUpdate {}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function createMenuLayout(menuBarEntry: any[]): MenuBarEntry[] {
@@ -1318,13 +1402,14 @@ function createMenuLayoutRecursive(children: any[][]): MenuBarEntry[][] {
 			...entry,
 			action: hoistWidgetHolders([entry.action])[0],
 			children: entry.children ? createMenuLayoutRecursive(entry.children) : undefined,
-		}))
+			disabled: entry.disabled ?? false,
+		})),
 	);
 }
 
 // `any` is used since the type of the object should be known from the Rust side
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type JSMessageFactory = (data: any, wasm: WasmRawInstance, instance: WasmEditorInstance) => JsMessage;
+type JSMessageFactory = (data: any, wasm: WebAssembly.Memory, handle: EditorHandle) => JsMessage;
 type MessageMaker = typeof JsMessage | JSMessageFactory;
 
 export const messageMakers: Record<string, MessageMaker> = {
@@ -1332,14 +1417,16 @@ export const messageMakers: Record<string, MessageMaker> = {
 	DisplayDialogDismiss,
 	DisplayDialogPanic,
 	DisplayEditableTextbox,
+	DisplayEditableTextboxTransform,
 	DisplayRemoveEditableTextbox,
 	TriggerAboutGraphiteLocalizedCommitDate,
-	TriggerImaginateCheckServerStatus,
-	TriggerImaginateGenerate,
-	TriggerImaginateTerminate,
-	TriggerNodeGraphFrameGenerate,
-	TriggerFileDownload,
+	TriggerCopyToClipboardBlobUrl,
+	TriggerFetchAndOpenDocument,
+	TriggerDownloadBlobUrl,
+	TriggerDownloadImage,
+	TriggerDownloadTextFile,
 	TriggerFontLoad,
+	TriggerGraphViewOverlay,
 	TriggerImport,
 	TriggerIndexedDbRemoveDocument,
 	TriggerIndexedDbWriteDocument,
@@ -1347,7 +1434,6 @@ export const messageMakers: Record<string, MessageMaker> = {
 	TriggerLoadPreferences,
 	TriggerOpenDocument,
 	TriggerPaste,
-	TriggerRasterDownload,
 	TriggerRefreshBoundsOfViewports,
 	TriggerRevokeBlobUrl,
 	TriggerSavePreferences,
@@ -1356,30 +1442,38 @@ export const messageMakers: Record<string, MessageMaker> = {
 	TriggerViewportResize,
 	TriggerVisitLink,
 	UpdateActiveDocument,
-	UpdateDialogDetails,
-	UpdateDocumentArtboards,
+	UpdateBox,
+	UpdateContextMenuInformation,
+	UpdateLayerWidths,
+	UpdateDialogButtons,
+	UpdateDialogColumn1,
+	UpdateDialogColumn2,
 	UpdateDocumentArtwork,
 	UpdateDocumentBarLayout,
 	UpdateDocumentLayerDetails,
-	UpdateDocumentLayerTreeStructure: newUpdateDocumentLayerTreeStructure,
+	UpdateDocumentLayerStructureJs,
 	UpdateDocumentModeLayout,
-	UpdateDocumentOverlays,
 	UpdateDocumentRulers,
-	UpdateEyedropperSamplingState,
 	UpdateDocumentScrollbars,
-	UpdateImageData,
+	UpdateEyedropperSamplingState,
 	UpdateInputHints,
-	UpdateLayerTreeOptionsLayout,
+	UpdateLayersPanelOptionsLayout,
 	UpdateMenuBarLayout,
 	UpdateMouseCursor,
 	UpdateNodeGraph,
+	UpdateNodeGraphBarLayout,
+	UpdateNodeGraphSelection,
+	UpdateNodeGraphTransform,
+	UpdateNodeThumbnail,
 	UpdateNodeTypes,
-	UpdateNodeGraphVisibility,
 	UpdateOpenDocumentsList,
 	UpdatePropertyPanelOptionsLayout,
 	UpdatePropertyPanelSectionsLayout,
+	UpdateSubgraphPath,
 	UpdateToolOptionsLayout,
 	UpdateToolShelfLayout,
 	UpdateWorkingColorsLayout,
+	UpdateWirePathInProgress,
+	UpdateZoomWithScroll,
 } as const;
 export type JsMessageType = keyof typeof messageMakers;

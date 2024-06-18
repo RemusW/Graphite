@@ -1,16 +1,8 @@
-use crate::consts::DRAG_THRESHOLD;
-use crate::messages::frontend::utility_types::MouseCursorIcon;
-use crate::messages::input_mapper::utility_types::input_keyboard::{Key, KeysGroup, MouseMotion};
-use crate::messages::layout::utility_types::layout_widget::PropertyHolder;
-use crate::messages::prelude::*;
+use super::tool_prelude::*;
+use crate::messages::portfolio::document::utility_types::document_metadata::LayerNodeIdentifier;
 use crate::messages::tool::common_functionality::resize::Resize;
-use crate::messages::tool::utility_types::{EventToMessageMap, Fsm, ToolActionHandlerData, ToolMetadata, ToolTransition, ToolType};
-use crate::messages::tool::utility_types::{HintData, HintGroup, HintInfo};
 
-use graphene::Operation;
-
-use glam::DAffine2;
-use serde::{Deserialize, Serialize};
+use graph_craft::document::{generate_uuid, NodeId};
 
 #[derive(Default)]
 pub struct ImaginateTool {
@@ -18,54 +10,35 @@ pub struct ImaginateTool {
 	tool_data: ImaginateToolData,
 }
 
-#[remain::sorted]
 #[impl_message(Message, ToolMessage, Imaginate)]
-#[derive(PartialEq, Eq, Clone, Debug, Hash, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Debug, Hash, serde::Serialize, serde::Deserialize, specta::Type)]
 pub enum ImaginateToolMessage {
 	// Standard messages
-	#[remain::unsorted]
 	Abort,
 
 	// Tool-specific messages
 	DragStart,
 	DragStop,
-	Resize {
-		center: Key,
-		lock_ratio: Key,
-	},
+	Resize { center: Key, lock_ratio: Key },
 }
 
-impl PropertyHolder for ImaginateTool {}
+impl LayoutHolder for ImaginateTool {
+	fn layout(&self) -> Layout {
+		Layout::WidgetLayout(WidgetLayout::default())
+	}
+}
 
-impl<'a> MessageHandler<ToolMessage, ToolActionHandlerData<'a>> for ImaginateTool {
-	fn process_message(&mut self, message: ToolMessage, tool_data: ToolActionHandlerData<'a>, responses: &mut VecDeque<Message>) {
-		if message == ToolMessage::UpdateHints {
-			self.fsm_state.update_hints(responses);
-			return;
-		}
-
-		if message == ToolMessage::UpdateCursor {
-			self.fsm_state.update_cursor(responses);
-			return;
-		}
-
-		let new_state = self.fsm_state.transition(message, &mut self.tool_data, tool_data, &(), responses);
-
-		if self.fsm_state != new_state {
-			self.fsm_state = new_state;
-			self.fsm_state.update_hints(responses);
-			self.fsm_state.update_cursor(responses);
-		}
+impl<'a> MessageHandler<ToolMessage, &mut ToolActionHandlerData<'a>> for ImaginateTool {
+	fn process_message(&mut self, message: ToolMessage, responses: &mut VecDeque<Message>, tool_data: &mut ToolActionHandlerData<'a>) {
+		self.fsm_state.process_event(message, &mut self.tool_data, tool_data, &(), responses, true);
 	}
 
 	fn actions(&self) -> ActionList {
-		use ImaginateToolFsmState::*;
-
 		match self.fsm_state {
-			Ready => actions!(ImaginateToolMessageDiscriminant;
+			ImaginateToolFsmState::Ready => actions!(ImaginateToolMessageDiscriminant;
 				DragStart,
 			),
-			Drawing => actions!(ImaginateToolMessageDiscriminant;
+			ImaginateToolFsmState::Drawing => actions!(ImaginateToolMessageDiscriminant;
 				DragStop,
 				Abort,
 				Resize,
@@ -89,24 +62,19 @@ impl ToolMetadata for ImaginateTool {
 impl ToolTransition for ImaginateTool {
 	fn event_to_message_map(&self) -> EventToMessageMap {
 		EventToMessageMap {
-			document_dirty: None,
 			tool_abort: Some(ImaginateToolMessage::Abort.into()),
-			selection_changed: None,
+			..Default::default()
 		}
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ImaginateToolFsmState {
+	#[default]
 	Ready,
 	Drawing,
 }
 
-impl Default for ImaginateToolFsmState {
-	fn default() -> Self {
-		ImaginateToolFsmState::Ready
-	}
-}
 #[derive(Clone, Debug, Default)]
 struct ImaginateToolData {
 	data: Resize,
@@ -120,112 +88,102 @@ impl Fsm for ImaginateToolFsmState {
 		self,
 		event: ToolMessage,
 		tool_data: &mut Self::ToolData,
-		(document, _document_id, _global_tool_data, input, font_cache): ToolActionHandlerData,
+		ToolActionHandlerData { document, input, .. }: &mut ToolActionHandlerData,
 		_tool_options: &Self::ToolOptions,
 		responses: &mut VecDeque<Message>,
 	) -> Self {
-		use ImaginateToolFsmState::*;
-		use ImaginateToolMessage::*;
+		let shape_data = &mut tool_data.data;
 
-		let mut shape_data = &mut tool_data.data;
+		let ToolMessage::Imaginate(event) = event else {
+			return self;
+		};
+		match (self, event) {
+			(ImaginateToolFsmState::Ready, ImaginateToolMessage::DragStart) => {
+				shape_data.start(document, input);
+				responses.add(DocumentMessage::StartTransaction);
+				shape_data.layer = Some(LayerNodeIdentifier::new(NodeId(generate_uuid()), document.network()));
+				responses.add(DocumentMessage::DeselectAllLayers);
 
-		if let ToolMessage::Imaginate(event) = event {
-			match (self, event) {
-				(Ready, DragStart) => {
-					shape_data.start(responses, document, input.mouse.position, font_cache);
-					responses.push_back(DocumentMessage::StartTransaction.into());
-					shape_data.path = Some(document.get_path_for_new_layer());
-					responses.push_back(DocumentMessage::DeselectAllLayers.into());
+				// // Utility function to offset the position of each consecutive node
+				// let mut pos = 8;
+				// let mut next_pos = || {
+				// 	pos += 8;
+				// 	DocumentNodeMetadata::position((pos, 4))
+				// };
 
-					responses.push_back(
-						Operation::AddImaginateFrame {
-							path: shape_data.path.clone().unwrap(),
-							insert_index: -1,
-							transform: DAffine2::ZERO.to_cols_array(),
-						}
-						.into(),
-					);
+				// // Get the node type for the Transform and Imaginate nodes
+				// let Some(transform_node_type) = resolve_document_node_type("Transform") else {
+				// 	warn!("Transform node should be in registry");
+				// 	return ImaginateToolFsmState::Drawing;
+				// };
+				// let imaginate_node_type = &*IMAGINATE_NODE;
 
-					Drawing
-				}
-				(state, Resize { center, lock_ratio }) => {
-					if let Some(message) = shape_data.calculate_transform(responses, document, center, lock_ratio, input) {
-						responses.push_back(message);
-					}
+				// // Give them a unique ID
+				// let transform_node_id = NodeId(100);
+				let imaginate_node_id = NodeId(101);
 
-					state
-				}
-				(Drawing, DragStop) => {
-					match shape_data.drag_start.distance(input.mouse.position) <= DRAG_THRESHOLD {
-						true => responses.push_back(DocumentMessage::AbortTransaction.into()),
-						false => responses.push_back(DocumentMessage::CommitTransaction.into()),
-					}
+				// Create the network based on the Input -> Output passthrough default network
+				// let mut network = new_image_network(16, imaginate_node_id);
 
-					shape_data.cleanup(responses);
+				// // Insert the nodes into the default network
+				// network.insert_node(
+				// 	transform_node_id,
+				// 	transform_node_type.to_document_node_default_inputs([Some(NodeInput::node(NodeId(0), 0))], next_pos()),
+				// );
+				// network.insert_node(
+				// 	imaginate_node_id,
+				// 	imaginate_node_type.to_document_node_default_inputs([Some(NodeInput::node(transform_node_id, 0))], next_pos()),
+				// );
+				responses.add(NodeGraphMessage::ShiftNode { node_id: imaginate_node_id });
 
-					Ready
-				}
-				(Drawing, Abort) => {
-					responses.push_back(DocumentMessage::AbortTransaction.into());
+				// // Add a layer with a frame to the document
+				// responses.add(Operation::AddFrame {
+				// 	path: shape_data.layer.unwrap().to_path(),
+				// 	insert_index: -1,
+				// 	transform: DAffine2::ZERO.to_cols_array(),
+				// 	network,
+				// });
 
-					shape_data.cleanup(responses);
-
-					Ready
-				}
-				_ => self,
+				ImaginateToolFsmState::Drawing
 			}
-		} else {
-			self
+			(state, ImaginateToolMessage::Resize { center, lock_ratio }) => {
+				let message = shape_data.calculate_transform(document, input, center, lock_ratio, true);
+				responses.try_add(message);
+
+				state
+			}
+			(ImaginateToolFsmState::Drawing, ImaginateToolMessage::DragStop) => {
+				input.mouse.finish_transaction(shape_data.viewport_drag_start(document), responses);
+				shape_data.cleanup(responses);
+
+				ImaginateToolFsmState::Ready
+			}
+			(ImaginateToolFsmState::Drawing, ImaginateToolMessage::Abort) => {
+				responses.add(DocumentMessage::AbortTransaction);
+
+				shape_data.cleanup(responses);
+
+				ImaginateToolFsmState::Ready
+			}
+			(_, ImaginateToolMessage::Abort) => ImaginateToolFsmState::Ready,
+			_ => self,
 		}
 	}
 
 	fn update_hints(&self, responses: &mut VecDeque<Message>) {
 		let hint_data = match self {
 			ImaginateToolFsmState::Ready => HintData(vec![HintGroup(vec![
-				HintInfo {
-					key_groups: vec![],
-					key_groups_mac: None,
-					mouse: Some(MouseMotion::LmbDrag),
-					label: String::from("Draw Repaint Frame"),
-					plus: false,
-				},
-				HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Shift])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("Constrain Square"),
-					plus: true,
-				},
-				HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Alt])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("From Center"),
-					plus: true,
-				},
+				HintInfo::mouse(MouseMotion::LmbDrag, "Draw Repaint Frame"),
+				HintInfo::keys([Key::Shift], "Constrain Square").prepend_plus(),
+				HintInfo::keys([Key::Alt], "From Center").prepend_plus(),
 			])]),
-			ImaginateToolFsmState::Drawing => HintData(vec![HintGroup(vec![
-				HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Shift])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("Constrain Square"),
-					plus: false,
-				},
-				HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Alt])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("From Center"),
-					plus: false,
-				},
-			])]),
+			ImaginateToolFsmState::Drawing => HintData(vec![HintGroup(vec![HintInfo::keys([Key::Shift], "Constrain Square"), HintInfo::keys([Key::Alt], "From Center")])]),
 		};
 
-		responses.push_back(FrontendMessage::UpdateInputHints { hint_data }.into());
+		responses.add(FrontendMessage::UpdateInputHints { hint_data });
 	}
 
 	fn update_cursor(&self, responses: &mut VecDeque<Message>) {
-		responses.push_back(FrontendMessage::UpdateMouseCursor { cursor: MouseCursorIcon::Crosshair }.into());
+		responses.add(FrontendMessage::UpdateMouseCursor { cursor: MouseCursorIcon::Crosshair });
 	}
 }

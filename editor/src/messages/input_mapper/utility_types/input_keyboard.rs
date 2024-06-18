@@ -1,11 +1,8 @@
 use crate::messages::portfolio::utility_types::KeyboardPlatformLayout;
 use crate::messages::prelude::*;
 
-pub use graphene::DocumentResponse;
-
 use bitflags::bitflags;
-use serde::ser::SerializeStruct;
-use serde::{Deserialize, Serialize};
+
 use std::fmt::{self, Display, Formatter};
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign};
 
@@ -34,8 +31,9 @@ pub enum KeyPosition {
 }
 
 bitflags! {
-	#[derive(Default, Serialize, Deserialize)]
+	#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 	#[repr(transparent)]
+	#[serde(transparent)]
 	pub struct ModifierKeys: u8 {
 		const SHIFT           = 0b_0000_0001;
 		const ALT             = 0b_0000_0010;
@@ -51,7 +49,8 @@ bitflags! {
 // (although we ignore the shift key, so the user doesn't have to press `Ctrl Shift +` on a US keyboard), even if the keyboard layout
 // is for a different locale where the `+` key is somewhere entirely different, shifted or not. This would then also work for numpad `+`.
 #[impl_message(Message, InputMapperMessage, KeyDown)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, specta::Type, num_enum::TryFromPrimitive)]
+#[repr(u8)]
 pub enum Key {
 	// Writing system keys
 	Digit0,
@@ -201,6 +200,7 @@ pub enum Key {
 
 	// Other keys that aren't part of the W3C spec
 	Command,
+	/// "Ctrl" on Windows/Linux, "Cmd" on Mac
 	Accel,
 	Lmb,
 	Rmb,
@@ -210,22 +210,10 @@ pub enum Key {
 	NumKeys,
 }
 
-impl Serialize for Key {
-	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-		let key = format!("{:?}", self);
-		let label = self.to_string();
-
-		let mut state = serializer.serialize_struct("KeyWithLabel", 2)?;
-		state.serialize_field("key", &key)?;
-		state.serialize_field("label", &label)?;
-		state.end()
-	}
-}
-
 impl fmt::Display for Key {
 	// TODO: Relevant key labels should be localized when we get around to implementing localization/internationalization
 	fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
-		let key_name = format!("{:?}", self);
+		let key_name = format!("{self:?}");
 
 		// Writing system keys
 		const DIGIT_PREFIX: &str = "Digit";
@@ -237,7 +225,7 @@ impl fmt::Display for Key {
 			return write!(f, "{}", key_name.chars().skip(KEY_PREFIX.len()).collect::<String>());
 		}
 
-		let keyboard_layout = || GLOBAL_PLATFORM.get().expect("Failed to get GLOBAL_PLATFORM").as_keyboard_platform_layout();
+		let keyboard_layout = || GLOBAL_PLATFORM.get().copied().unwrap_or_default().as_keyboard_platform_layout();
 
 		let name = match self {
 			// Writing system keys
@@ -304,14 +292,43 @@ impl fmt::Display for Key {
 			_ => key_name.as_str(),
 		};
 
-		write!(f, "{}", name)
+		write!(f, "{name}")
 	}
 }
+
+impl From<Key> for LayoutKey {
+	fn from(key: Key) -> Self {
+		Self {
+			key: format!("{key:?}"),
+			label: key.to_string(),
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, specta::Type)]
+struct LayoutKey {
+	key: String,
+	label: String,
+}
+/*
+impl Serialize for Key {
+	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+		let key = format!("{:?}", self.0);
+		let label = self.0.to_string();
+
+		assert_eq!(serde_json::to_string(Key::KeyEscape), {"key": KeyEscape, "label": "Esc"});
+
+		let mut state = serializer.serialize_struct("KeyWithLabel", 2)?;
+		state.serialize_field("key", &key)?;
+		state.serialize_field("label", &label)?;
+		state.end()
+	}
+}*/
 
 pub const NUMBER_OF_KEYS: usize = Key::NumKeys as usize;
 
 /// Only `Key`s that exist on a physical keyboard should be used.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeysGroup(pub Vec<Key>);
 
 impl fmt::Display for KeysGroup {
@@ -322,7 +339,7 @@ impl fmt::Display for KeysGroup {
 			.0
 			.iter()
 			.map(|key| {
-				let keyboard_layout = GLOBAL_PLATFORM.get().expect("Failed to get GLOBAL_PLATFORM").as_keyboard_platform_layout();
+				let keyboard_layout = GLOBAL_PLATFORM.get().copied().unwrap_or_default().as_keyboard_platform_layout();
 				let key_is_modifier = matches!(*key, Key::Control | Key::Command | Key::Alt | Key::Shift | Key::Meta | Key::Accel);
 
 				if keyboard_layout == KeyboardPlatformLayout::Mac && key_is_modifier {
@@ -338,11 +355,27 @@ impl fmt::Display for KeysGroup {
 			joined.truncate(joined.len() - JOINER_MARK.len());
 		}
 
-		write!(f, "{}", joined)
+		write!(f, "{joined}")
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+impl From<KeysGroup> for String {
+	fn from(keys: KeysGroup) -> Self {
+		let layout_keys: LayoutKeysGroup = keys.into();
+		serde_json::to_string(&layout_keys).expect("Failed to serialize KeysGroup")
+	}
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct LayoutKeysGroup(Vec<LayoutKey>);
+
+impl From<KeysGroup> for LayoutKeysGroup {
+	fn from(keys_group: KeysGroup) -> Self {
+		Self(keys_group.0.into_iter().map(|key| key.into()).collect())
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, specta::Type)]
 pub enum MouseMotion {
 	None,
 	Lmb,
@@ -351,8 +384,10 @@ pub enum MouseMotion {
 	ScrollUp,
 	ScrollDown,
 	Drag,
+	LmbDouble,
 	LmbDrag,
 	RmbDrag,
+	RmbDouble,
 	MmbDrag,
 }
 
@@ -389,6 +424,10 @@ impl<const LENGTH: usize> BitVector<LENGTH> {
 	pub fn get(&self, bitvector_index: usize) -> bool {
 		let (offset, bit) = Self::convert_index(bitvector_index);
 		(self.0[offset] & bit) != 0
+	}
+
+	pub fn key(&self, key: Key) -> bool {
+		self.get(key as usize)
 	}
 
 	pub fn is_empty(&self) -> bool {
@@ -431,7 +470,7 @@ impl<'a, const LENGTH: usize> Iterator for BitVectorIter<'a, LENGTH> {
 	type Item = usize;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		while self.iter_index < (STORAGE_SIZE_BITS as usize) * LENGTH {
+		while self.iter_index < STORAGE_SIZE_BITS * LENGTH {
 			let bit_value = self.bitvector.get(self.iter_index);
 
 			self.iter_index += 1;

@@ -1,85 +1,10 @@
-use crate::JS_EDITOR_HANDLES;
-
 use editor::messages::input_mapper::utility_types::input_keyboard::Key;
-use editor::messages::prelude::*;
-
-use std::panic;
-use wasm_bindgen::prelude::*;
-
-/// When a panic occurs, notify the user and log the error to the JS console before the backend dies
-pub fn panic_hook(info: &panic::PanicInfo) {
-	let header = "The editor crashed — sorry about that";
-	let description = "
-	An internal error occurred. Please report this by filing an issue on GitHub.\n\
-	\n\
-	Reload the editor to continue. If this happens immediately on repeated reloads, clear saved data.
-	"
-	.trim();
-
-	error!("{}", info);
-
-	JS_EDITOR_HANDLES.with(|instances| {
-		instances.borrow_mut().values_mut().for_each(|instance| {
-			instance.send_frontend_message_to_js_rust_proxy(FrontendMessage::DisplayDialogPanic {
-				panic_info: info.to_string(),
-				header: header.to_string(),
-				description: description.to_string(),
-			})
-		})
-	});
-}
-
-/// The JavaScript `Error` type
-#[wasm_bindgen]
-extern "C" {
-	#[derive(Clone, Debug)]
-	pub type Error;
-
-	#[wasm_bindgen(constructor)]
-	pub fn new(msg: &str) -> Error;
-}
-
-/// Logging to the JS console
-#[wasm_bindgen]
-extern "C" {
-	#[wasm_bindgen(js_namespace = console)]
-	fn log(msg: &str, format: &str);
-	#[wasm_bindgen(js_namespace = console)]
-	fn info(msg: &str, format: &str);
-	#[wasm_bindgen(js_namespace = console)]
-	fn warn(msg: &str, format: &str);
-	#[wasm_bindgen(js_namespace = console)]
-	fn error(msg: &str, format: &str);
-}
-
-#[derive(Default)]
-pub struct WasmLog;
-
-impl log::Log for WasmLog {
-	fn enabled(&self, metadata: &log::Metadata) -> bool {
-		metadata.level() <= log::Level::Info
-	}
-
-	fn log(&self, record: &log::Record) {
-		let (log, name, color): (fn(&str, &str), &str, &str) = match record.level() {
-			log::Level::Trace => (log, "trace", "color:plum"),
-			log::Level::Debug => (log, "debug", "color:cyan"),
-			log::Level::Warn => (warn, "warn", "color:goldenrod"),
-			log::Level::Info => (info, "info", "color:mediumseagreen"),
-			log::Level::Error => (error, "error", "color:red"),
-		};
-		let msg = &format!("%c{}\t{}", name, record.args());
-		log(msg, color)
-	}
-
-	fn flush(&self) {}
-}
 
 /// Translate a keyboard key from its JS name to its Rust `Key` enum
 pub fn translate_key(name: &str) -> Key {
 	use Key::*;
 
-	trace!("Key event received: {}", name);
+	trace!("Key event received: {name}");
 
 	match name {
 		// Writing system keys

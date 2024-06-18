@@ -1,4 +1,6 @@
-export type WasmRawInstance = typeof import("@/../wasm/pkg");
+import type * as WasmPkg from "@/../wasm/pkg";
+
+export type WasmRawInstance = typeof WasmPkg;
 export type WasmBezierInstance = InstanceType<WasmRawInstance["WasmBezier"]>;
 
 export type WasmBezierKey = keyof WasmBezierInstance;
@@ -9,28 +11,33 @@ export type WasmSubpathInstance = InstanceType<WasmRawInstance["WasmSubpath"]>;
 export type WasmSubpathManipulatorKey = "set_anchor" | "set_in_handle" | "set_out_handle";
 
 export const BEZIER_CURVE_TYPE = ["Linear", "Quadratic", "Cubic"] as const;
-export type BezierCurveType = typeof BEZIER_CURVE_TYPE[number];
+export type BezierCurveType = (typeof BEZIER_CURVE_TYPE)[number];
 
-export type ComputeType = "Euclidean" | "Parametric";
+export type BezierCallback = (bezier: WasmBezierInstance, options: Record<string, number>, mouseLocation?: [number, number]) => string;
+export type SubpathCallback = (subpath: WasmSubpathInstance, options: Record<string, number>, mouseLocation?: [number, number]) => string;
 
-export type BezierCallback = (bezier: WasmBezierInstance, options: Record<string, number>, mouseLocation?: [number, number], computeType?: ComputeType) => string;
-export type SubpathCallback = (subpath: WasmSubpathInstance) => string;
-
-export type ExampleOptions = {
+export type BezierDemoOptions = {
 	[key in BezierCurveType]: {
-		disabled: boolean;
-		sliderOptions: SliderOption[];
-		customPoints: number[][];
+		disabled?: boolean;
+		inputOptions?: InputOption[];
+		customPoints?: number[][];
 	};
 };
 
-export type SliderOption = {
-	min: number;
-	max: number;
-	step: number;
-	default: number;
+export type SubpathInputOption = InputOption & {
+	isDisabledForClosed?: boolean;
+};
+
+export type InputOption = {
 	variable: string;
+	min?: number;
+	max?: number;
+	step?: number;
+	default?: number;
 	unit?: string | string[];
+	inputType?: "slider" | "dropdown";
+	options?: string[];
+	disabled?: boolean;
 };
 
 export function getCurveType(numPoints: number): BezierCurveType {
@@ -53,3 +60,43 @@ export function getConstructorKey(bezierCurveType: BezierCurveType): WasmBezierC
 	};
 	return mapping[bezierCurveType];
 }
+
+export type DemoArgs = {
+	title: string;
+	disabled?: boolean;
+};
+
+export type BezierDemoArgs = {
+	points: number[][];
+	inputOptions: InputOption[];
+} & DemoArgs;
+
+export type SubpathDemoArgs = {
+	triples: (number[] | undefined)[][];
+	closed: boolean;
+} & DemoArgs;
+
+export type Demo = {
+	inputOptions: InputOption[];
+	sliderData: Record<string, number>;
+	sliderUnits: Record<string, string | string[]>;
+
+	drawDemo(figure: HTMLElement, mouseLocation?: [number, number]): void;
+	onMouseDown(event: MouseEvent): void;
+	onMouseUp(): void;
+	onMouseMove(event: MouseEvent): void;
+	getSliderUnit(sliderValue: number, variable: string): string;
+} & HTMLElement;
+
+export type DemoPane = {
+	name: string;
+	demos: DemoArgs[];
+	id: string;
+	buildDemo(demo: DemoArgs): HTMLElement;
+} & HTMLElement;
+
+export const BEZIER_T_VALUE_VARIANTS = ["Parametric", "Euclidean"] as const;
+export const SUBPATH_T_VALUE_VARIANTS = ["GlobalParametric", "GlobalEuclidean"] as const;
+
+export const CAP_VARIANTS = ["Butt", "Round", "Square"] as const;
+export const JOIN_VARIANTS = ["Bevel", "Miter", "Round"] as const;

@@ -1,13 +1,63 @@
 use crate::consts::{MAX_ABSOLUTE_DIFFERENCE, STRICT_MAX_ABSOLUTE_DIFFERENCE};
+use crate::ManipulatorGroup;
 
 use glam::{BVec2, DMat2, DVec2};
-use std::f64::consts::PI;
 
 #[derive(Copy, Clone, PartialEq)]
-pub enum ComputeType {
+/// A structure which can be used to reference a particular point along a `Bezier`.
+/// Assuming a 2-dimensional Bezier is represented as a parametric curve defined by components `(x(f(t), y(f(t))))`, this structure defines variants for `f(t)`.
+/// - The `Parametric` variant represents the point calculated using the parametric equation of the curve at argument `t`. That is, `f(t) = t`. Speed along the curve's parametric form is not constant. `t` must lie in the range `[0, 1]`.
+/// - The `Euclidean` variant represents the point calculated at a distance ratio `t` along the arc length of the curve in the range `[0, 1]`. Speed is constant along the curve's arc length.
+///   - E.g. If `d` is the distance from the start point of a `Bezier` to a certain point along the curve, and `l` is the total arc length of the curve, that certain point lies at a distance ratio `t = d / l`.
+///   - All `Bezier` functions will implicitly convert a Euclidean [TValue] argument to a parametric `t`-value using binary search, computed within a particular error. That is, a point at distance ratio `t*`,
+///     satisfying `|t* - t| <= error`. The default error is `0.001`. Given this requires a lengthier calculation, it is not recommended to use the `Euclidean` or `EuclideanWithinError` variants frequently in computationally intensive tasks.
+/// - The `EuclideanWithinError` variant functions exactly as the `Euclidean` variant, but allows the `error` to be customized when computing `t` internally.
+pub enum TValue {
 	Parametric(f64),
 	Euclidean(f64),
-	EuclideanWithinError { t: f64, epsilon: f64 },
+	EuclideanWithinError { t: f64, error: f64 },
+}
+
+#[derive(Copy, Clone, PartialEq)]
+pub enum TValueType {
+	Parametric,
+	Euclidean,
+}
+
+#[derive(Copy, Clone, PartialEq)]
+pub enum SubpathTValue {
+	Parametric { segment_index: usize, t: f64 },
+	GlobalParametric(f64),
+	Euclidean { segment_index: usize, t: f64 },
+	GlobalEuclidean(f64),
+	EuclideanWithinError { segment_index: usize, t: f64, error: f64 },
+	GlobalEuclideanWithinError { t: f64, error: f64 },
+}
+
+#[derive(Copy, Clone)]
+/// Represents the shape of the join between two segments of a path which meet at an angle.
+/// Bevel provides a flat connection, Miter provides a sharp connection, and Round provides a rounded connection.
+/// As defined in SVG: <https://www.w3.org/TR/SVG2/painting.html#LineJoin>.
+pub enum Join {
+	/// The join is a straight line between the end points of the offset path sides from the two connecting segments.
+	Bevel,
+	/// Optional f64 is the miter limit, which defaults to 4 if `None` or a value less than 1 is provided.
+	/// The miter limit is used to prevent highly sharp angles from resulting in excessively long miter joins.
+	/// If the miter limit is exceeded, the join will be converted to a bevel join.
+	/// The value is the ratio of the miter length to the stroke width.
+	/// When that ratio is greater than the miter limit, a bevel join is used instead.
+	Miter(Option<f64>),
+	/// The join is a circular arc between the end points of the offset path sides from the two connecting segments.
+	Round,
+}
+
+#[derive(Copy, Clone)]
+/// Enum to represent the cap type at the ends of an outline
+/// As defined in SVG: <https://www.w3.org/TR/SVG2/painting.html#LineCaps>.
+pub enum Cap {
+	Butt,
+	Round,
+	Square,
 }
 
 /// Helper to perform the computation of a and c, where b is the provided point on the curve.
@@ -40,95 +90,35 @@ pub fn compute_abc_for_cubic_through_points(start_point: DVec2, point_on_curve: 
 	compute_abc_through_points(start_point, point_on_curve, end_point, t_cubed, cubed_one_minus_t)
 }
 
-/// Return the index and the value of the closest point in the LUT compared to the provided point.
-pub fn get_closest_point_in_lut(lut: &[DVec2], point: DVec2) -> (usize, f64) {
-	lut.iter()
-		.enumerate()
-		.map(|(i, p)| (i, point.distance_squared(*p)))
-		.min_by(|x, y| (&(x.1)).partial_cmp(&(y.1)).unwrap())
-		.unwrap()
-}
-
-// TODO: Use an `Option` return type instead of a `Vec`
 /// Find the roots of the linear equation `ax + b`.
-pub fn solve_linear(a: f64, b: f64) -> Vec<f64> {
-	let mut roots = Vec::new();
+pub fn solve_linear(a: f64, b: f64) -> [Option<f64>; 3] {
 	// There exist roots when `a` is not 0
 	if a.abs() > MAX_ABSOLUTE_DIFFERENCE {
-		roots.push(-b / a);
+		[Some(-b / a), None, None]
+	} else {
+		[None; 3]
 	}
-	roots
 }
 
-// TODO: Use an `impl Iterator` return type instead of a `Vec`
 /// Find the roots of the linear equation `ax^2 + bx + c`.
 /// Precompute the `discriminant` (`b^2 - 4ac`) and `two_times_a` arguments prior to calling this function for efficiency purposes.
-pub fn solve_quadratic(discriminant: f64, two_times_a: f64, b: f64, c: f64) -> Vec<f64> {
-	let mut roots = Vec::new();
+pub fn solve_quadratic(discriminant: f64, two_times_a: f64, b: f64, c: f64) -> [Option<f64>; 3] {
+	let mut roots = [None; 3];
 	if two_times_a.abs() <= STRICT_MAX_ABSOLUTE_DIFFERENCE {
 		roots = solve_linear(b, c);
 	} else if discriminant.abs() <= STRICT_MAX_ABSOLUTE_DIFFERENCE {
-		roots.push(-b / (two_times_a));
+		roots[0] = Some(-b / (two_times_a));
 	} else if discriminant > 0. {
 		let root_discriminant = discriminant.sqrt();
-		roots.push((-b + root_discriminant) / (two_times_a));
-		roots.push((-b - root_discriminant) / (two_times_a));
-	}
-	roots
-}
-
-/// Compute the cube root of a number.
-fn cube_root(f: f64) -> f64 {
-	if f < 0. {
-		-(-f).powf(1. / 3.)
-	} else {
-		f.powf(1. / 3.)
-	}
-}
-
-// TODO: Use an `impl Iterator` return type instead of a `Vec`
-/// Solve a cubic of the form `x^3 + px + q`, derivation from: <https://trans4mind.com/personal_development/mathematics/polynomials/cubicAlgebra.htm>.
-pub fn solve_reformatted_cubic(discriminant: f64, a: f64, p: f64, q: f64) -> Vec<f64> {
-	let mut roots = Vec::new();
-	if p.abs() <= STRICT_MAX_ABSOLUTE_DIFFERENCE {
-		// Handle when p is approximately 0
-		roots.push(cube_root(-q));
-	} else if q.abs() <= STRICT_MAX_ABSOLUTE_DIFFERENCE {
-		// Handle when q is approximately 0
-		if p < 0. {
-			roots.push((-p).powf(1. / 2.));
-		}
-	} else if discriminant.abs() <= STRICT_MAX_ABSOLUTE_DIFFERENCE {
-		// When discriminant is 0 (check for approximation because of floating point errors), all roots are real, and 2 are repeated
-		let q_divided_by_2 = q / 2.;
-		let a_divided_by_3 = a / 3.;
-
-		roots.push(2. * cube_root(-q_divided_by_2) - a_divided_by_3);
-		roots.push(cube_root(q_divided_by_2) - a_divided_by_3);
-	} else if discriminant > 0. {
-		// When discriminant > 0, there is one real and two imaginary roots
-		let q_divided_by_2 = q / 2.;
-		let square_root_discriminant = discriminant.powf(1. / 2.);
-
-		roots.push(cube_root(-q_divided_by_2 + square_root_discriminant) - cube_root(q_divided_by_2 + square_root_discriminant) - a / 3.);
-	} else {
-		// Otherwise, discriminant < 0 and there are three real roots
-		let p_divided_by_3 = p / 3.;
-		let a_divided_by_3 = a / 3.;
-		let cube_root_r = (-p_divided_by_3).powf(1. / 2.);
-		let phi = (-q / (2. * cube_root_r.powi(3))).acos();
-
-		let two_times_cube_root_r = 2. * cube_root_r;
-		roots.push(two_times_cube_root_r * (phi / 3.).cos() - a_divided_by_3);
-		roots.push(two_times_cube_root_r * ((phi + 2. * PI) / 3.).cos() - a_divided_by_3);
-		roots.push(two_times_cube_root_r * ((phi + 4. * PI) / 3.).cos() - a_divided_by_3);
+		roots[0] = Some((-b + root_discriminant) / (two_times_a));
+		roots[1] = Some((-b - root_discriminant) / (two_times_a));
 	}
 	roots
 }
 
 // TODO: Use an `impl Iterator` return type instead of a `Vec`
 /// Solve a cubic of the form `ax^3 + bx^2 + ct + d`.
-pub fn solve_cubic(a: f64, b: f64, c: f64, d: f64) -> Vec<f64> {
+pub fn solve_cubic(a: f64, b: f64, c: f64, d: f64) -> [Option<f64>; 3] {
 	if a.abs() <= STRICT_MAX_ABSOLUTE_DIFFERENCE {
 		if b.abs() <= STRICT_MAX_ABSOLUTE_DIFFERENCE {
 			// If both a and b are approximately 0, treat as a linear problem
@@ -139,15 +129,45 @@ pub fn solve_cubic(a: f64, b: f64, c: f64, d: f64) -> Vec<f64> {
 			solve_quadratic(discriminant, 2. * b, c, d)
 		}
 	} else {
-		let new_a = b / a;
-		let new_b = c / a;
-		let new_c = d / a;
-
-		// Refactor cubic to be of the form: a(t^3 + pt + q), derivation from: https://trans4mind.com/personal_development/mathematics/polynomials/cubicAlgebra.htm
-		let p = (3. * new_b - new_a * new_a) / 3.;
-		let q = (2. * new_a.powi(3) - 9. * new_a * new_b + 27. * new_c) / 27.;
-		let discriminant = (p / 3.).powi(3) + (q / 2.).powi(2);
-		solve_reformatted_cubic(discriminant, new_a, p, q)
+		// https://momentsingraphics.de/CubicRoots.html
+		let d_recip = a.recip();
+		const ONETHIRD: f64 = 1. / 3.;
+		let scaled_c2 = b * (ONETHIRD * d_recip);
+		let scaled_c1 = c * (ONETHIRD * d_recip);
+		let scaled_c0 = d * d_recip;
+		if !(scaled_c0.is_finite() && scaled_c1.is_finite() && scaled_c2.is_finite()) {
+			// cubic coefficient is zero or nearly so.
+			return solve_quadratic(c * c - 4. * b * d, 2. * b, c, d);
+		}
+		let (c0, c1, c2) = (scaled_c0, scaled_c1, scaled_c2);
+		// (d0, d1, d2) is called "Delta" in article
+		let d0 = (-c2).mul_add(c2, c1);
+		let d1 = (-c1).mul_add(c2, c0);
+		let d2 = c2 * c0 - c1 * c1;
+		// d is called "Discriminant"
+		let d = 4. * d0 * d2 - d1 * d1;
+		// de is called "Depressed.x", Depressed.y = d0
+		let de = (-2. * c2).mul_add(d0, d1);
+		if d < 0. {
+			let sq = (-0.25 * d).sqrt();
+			let r = -0.5 * de;
+			let t1 = (r + sq).cbrt() + (r - sq).cbrt();
+			[Some(t1 - c2), None, None]
+		} else if d == 0. {
+			let t1 = (-d0).sqrt().copysign(de);
+			[Some(t1 - c2), Some(-2. * t1 - c2).filter(|&a| a != t1 - c2), None]
+		} else {
+			let th = d.sqrt().atan2(-de) * ONETHIRD;
+			// (th_cos, th_sin) is called "CubicRoot"
+			let (th_sin, th_cos) = th.sin_cos();
+			// (r0, r1, r2) is called "Root"
+			let r0 = th_cos;
+			let ss3 = th_sin * 3_f64.sqrt();
+			let r1 = 0.5 * (-th_cos + ss3);
+			let r2 = 0.5 * (-th_cos - ss3);
+			let t = 2. * (-d0).sqrt();
+			[Some(t.mul_add(r0, -c2)), Some(t.mul_add(r1, -c2)), Some(t.mul_add(r2, -c2))]
+		}
 	}
 }
 
@@ -214,8 +234,8 @@ pub fn compute_circle_center_from_points(p1: DVec2, p2: DVec2, p3: DVec2) -> Opt
 }
 
 /// Compare two `f64` numbers with a provided max absolute value difference.
-pub fn f64_compare(f1: f64, f2: f64, max_abs_diff: f64) -> bool {
-	(f1 - f2).abs() < max_abs_diff
+pub fn f64_compare(a: f64, b: f64, max_abs_diff: f64) -> bool {
+	(a - b).abs() < max_abs_diff
 }
 
 /// Determine if an `f64` number is within a given range by using a max absolute value difference comparison.
@@ -224,13 +244,13 @@ pub fn f64_approximately_in_range(value: f64, min: f64, max: f64, max_abs_diff: 
 }
 
 /// Compare the two values in a `DVec2` independently with a provided max absolute value difference.
-pub fn dvec2_compare(dv1: DVec2, dv2: DVec2, max_abs_diff: f64) -> BVec2 {
-	BVec2::new((dv1.x - dv2.x).abs() < max_abs_diff, (dv1.y - dv2.y).abs() < max_abs_diff)
+pub fn dvec2_compare(a: DVec2, b: DVec2, max_abs_diff: f64) -> BVec2 {
+	BVec2::new((a.x - b.x).abs() < max_abs_diff, (a.y - b.y).abs() < max_abs_diff)
 }
 
 /// Determine if the values in a `DVec2` are within a given range independently by using a max absolute value difference comparison.
-pub fn dvec2_approximately_in_range(point: DVec2, min: DVec2, max: DVec2, max_abs_diff: f64) -> BVec2 {
-	(point.cmpge(min) & point.cmple(max)) | dvec2_compare(point, min, max_abs_diff) | dvec2_compare(point, max, max_abs_diff)
+pub fn dvec2_approximately_in_range(point: DVec2, min_corner: DVec2, max_corner: DVec2, max_abs_diff: f64) -> BVec2 {
+	(point.cmpge(min_corner) & point.cmple(max_corner)) | dvec2_compare(point, min_corner, max_abs_diff) | dvec2_compare(point, max_corner, max_abs_diff)
 }
 
 /// Calculate a new position for a point given its original position, a unit vector in the desired direction, and a distance to move it by.
@@ -244,53 +264,83 @@ pub fn scale_point_from_origin(point: DVec2, origin: DVec2, should_flip_directio
 	scale_point_from_direction_vector(point, (origin - point).normalize(), should_flip_direction, distance)
 }
 
+/// Computes the necessary details to form a circular join from `left` to `right`, along a circle around `center`.
+/// By default, the angle is assumed to be 180 degrees.
+pub fn compute_circular_subpath_details<ManipulatorGroupId: crate::Identifier>(
+	left: DVec2,
+	arc_point: DVec2,
+	right: DVec2,
+	center: DVec2,
+	angle: Option<f64>,
+) -> (DVec2, ManipulatorGroup<ManipulatorGroupId>, DVec2) {
+	let center_to_arc_point = arc_point - center;
+
+	// Based on https://pomax.github.io/bezierinfo/#circles_cubic
+	let handle_offset_factor = if let Some(angle) = angle { 4. / 3. * (angle / 4.).tan() } else { 0.551784777779014 };
+
+	(
+		left - (left - center).perp() * handle_offset_factor,
+		ManipulatorGroup::new(
+			arc_point,
+			Some(arc_point + center_to_arc_point.perp() * handle_offset_factor),
+			Some(arc_point - center_to_arc_point.perp() * handle_offset_factor),
+		),
+		right + (right - center).perp() * handle_offset_factor,
+	)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::consts::MAX_ABSOLUTE_DIFFERENCE;
 
 	/// Compare vectors of `f64`s with a provided max absolute value difference.
-	fn f64_compare_vector(vec1: Vec<f64>, vec2: Vec<f64>, max_abs_diff: f64) -> bool {
-		vec1.len() == vec2.len() && vec1.into_iter().zip(vec2.into_iter()).all(|(a, b)| f64_compare(a, b, max_abs_diff))
+	fn f64_compare_vector(a: Vec<f64>, b: Vec<f64>, max_abs_diff: f64) -> bool {
+		a.len() == b.len() && a.into_iter().zip(b).all(|(a, b)| f64_compare(a, b, max_abs_diff))
+	}
+
+	fn collect_roots(mut roots: [Option<f64>; 3]) -> Vec<f64> {
+		roots.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+		roots.into_iter().flatten().collect()
 	}
 
 	#[test]
 	fn test_solve_linear() {
 		// Line that is on the x-axis
-		assert!(solve_linear(0., 0.).is_empty());
+		assert!(collect_roots(solve_linear(0., 0.)).is_empty());
 		// Line that is parallel to but not on the x-axis
-		assert!(solve_linear(0., 1.).is_empty());
+		assert!(collect_roots(solve_linear(0., 1.)).is_empty());
 		// Line with a non-zero slope
-		assert!(solve_linear(2., -8.) == vec![4.]);
+		assert!(collect_roots(solve_linear(2., -8.)) == vec![4.]);
 	}
 
 	#[test]
 	fn test_solve_cubic() {
 		// discriminant == 0
-		let roots1 = solve_cubic(1., 0., 0., 0.);
+		let roots1 = collect_roots(solve_cubic(1., 0., 0., 0.));
 		assert!(roots1 == vec![0.]);
 
-		let roots2 = solve_cubic(1., 3., 0., -4.);
-		assert!(roots2 == vec![1., -2.]);
+		let roots2 = collect_roots(solve_cubic(1., 3., 0., -4.));
+		assert!(roots2 == vec![-2., 1.]);
 
 		// p == 0
-		let roots3 = solve_cubic(1., 0., 0., -1.);
+		let roots3 = collect_roots(solve_cubic(1., 0., 0., -1.));
 		assert!(roots3 == vec![1.]);
 
 		// discriminant > 0
-		let roots4 = solve_cubic(1., 3., 0., 2.);
+		let roots4 = collect_roots(solve_cubic(1., 3., 0., 2.));
 		assert!(f64_compare_vector(roots4, vec![-3.196], MAX_ABSOLUTE_DIFFERENCE));
 
 		// discriminant < 0
-		let roots5 = solve_cubic(1., 3., 0., -1.);
-		assert!(f64_compare_vector(roots5, vec![0.532, -2.879, -0.653], MAX_ABSOLUTE_DIFFERENCE));
+		let roots5 = collect_roots(solve_cubic(1., 3., 0., -1.));
+		assert!(f64_compare_vector(roots5, vec![-2.879, -0.653, 0.532], MAX_ABSOLUTE_DIFFERENCE));
 
 		// quadratic
-		let roots6 = solve_cubic(0., 3., 0., -3.);
-		assert!(roots6 == vec![1., -1.]);
+		let roots6 = collect_roots(solve_cubic(0., 3., 0., -3.));
+		assert!(roots6 == vec![-1., 1.]);
 
 		// linear
-		let roots7 = solve_cubic(0., 0., 1., -1.);
+		let roots7 = collect_roots(solve_cubic(0., 0., 1., -1.));
 		assert!(roots7 == vec![1.]);
 	}
 

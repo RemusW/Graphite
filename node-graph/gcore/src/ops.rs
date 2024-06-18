@@ -1,219 +1,387 @@
+use crate::Node;
 use core::marker::PhantomData;
-use core::ops::Add;
+use core::ops::{Add, Div, Mul, Rem, Sub};
+use num_traits::Pow;
 
-use crate::{Node, RefNode};
+#[cfg(target_arch = "spirv")]
+use spirv_std::num_traits::float::Float;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AddNode;
-impl<'n, L: Add<R, Output = O> + 'n, R, O: 'n> Node<(L, R)> for AddNode {
+// Add Pair
+// TODO: Delete this redundant (two-argument version of the) add node. It's only used in tests.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct AddPairNode;
+impl<'i, L: Add<R, Output = O> + 'i, R: 'i, O: 'i> Node<'i, (L, R)> for AddPairNode {
 	type Output = <L as Add<R>>::Output;
-	fn eval(self, input: (L, R)) -> Self::Output {
+	fn eval(&'i self, input: (L, R)) -> Self::Output {
 		input.0 + input.1
 	}
 }
-impl<'n, L: Add<R, Output = O> + 'n, R, O: 'n> Node<(L, R)> for &'n AddNode {
-	type Output = <L as Add<R>>::Output;
-	fn eval(self, input: (L, R)) -> Self::Output {
-		input.0 + input.1
-	}
-}
-impl<'n, L: Add<R, Output = O> + 'n + Copy, R: Copy, O: 'n> Node<&'n (L, R)> for AddNode {
-	type Output = <L as Add<R>>::Output;
-	fn eval(self, input: &'n (L, R)) -> Self::Output {
-		input.0 + input.1
-	}
-}
-impl<'n, L: Add<R, Output = O> + 'n + Copy, R: Copy, O: 'n> Node<&'n (L, R)> for &'n AddNode {
-	type Output = <L as Add<R>>::Output;
-	fn eval(self, input: &'n (L, R)) -> Self::Output {
-		input.0 + input.1
+impl AddPairNode {
+	pub const fn new() -> Self {
+		Self
 	}
 }
 
+// Add
+pub struct AddNode<Second> {
+	second: Second,
+}
+#[node_macro::node_fn(AddNode)]
+fn add_parameter<U, T>(first: U, second: T) -> <U as Add<T>>::Output
+where
+	U: Add<T>,
+{
+	first + second
+}
+
+// Subtract
+pub struct SubtractNode<Second> {
+	second: Second,
+}
+#[node_macro::node_fn(SubtractNode)]
+fn sub<U, T>(first: U, second: T) -> <U as Sub<T>>::Output
+where
+	U: Sub<T>,
+{
+	first - second
+}
+
+// Divide
+pub struct DivideNode<Second> {
+	second: Second,
+}
+#[node_macro::node_fn(DivideNode)]
+fn div<U, T>(first: U, second: T) -> <U as Div<T>>::Output
+where
+	U: Div<T>,
+{
+	first / second
+}
+
+// Multiply
+pub struct MultiplyNode<Second> {
+	second: Second,
+}
+#[node_macro::node_fn(MultiplyNode)]
+fn mul<U, T>(first: U, second: T) -> <U as Mul<T>>::Output
+where
+	U: Mul<T>,
+{
+	first * second
+}
+
+// Exponent
+pub struct ExponentNode<Second> {
+	second: Second,
+}
+#[node_macro::node_fn(ExponentNode)]
+fn exp<U, T>(first: U, second: T) -> <U as Pow<T>>::Output
+where
+	U: Pow<T>,
+{
+	first.pow(second)
+}
+
+// Floor
+pub struct FloorNode;
+#[node_macro::node_fn(FloorNode)]
+fn floor(input: f64) -> f64 {
+	input.floor()
+}
+
+// Ceil
+pub struct CeilingNode;
+#[node_macro::node_fn(CeilingNode)]
+fn ceil(input: f64) -> f64 {
+	input.ceil()
+}
+
+// Round
+pub struct RoundNode;
+#[node_macro::node_fn(RoundNode)]
+fn round(input: f64) -> f64 {
+	input.round()
+}
+
+// Absolute Value
+pub struct AbsoluteValue;
+#[node_macro::node_fn(AbsoluteValue)]
+fn abs(input: f64) -> f64 {
+	input.abs()
+}
+
+// Log
+pub struct LogarithmNode<Second> {
+	second: Second,
+}
+#[node_macro::node_fn(LogarithmNode)]
+fn ln<U: num_traits::float::Float>(first: U, second: U) -> U {
+	first.log(second)
+}
+
+// Natural Log
+pub struct NaturalLogarithmNode;
+#[node_macro::node_fn(NaturalLogarithmNode)]
+fn ln(input: f64) -> f64 {
+	input.ln()
+}
+
+// Sine
+pub struct SineNode;
+#[node_macro::node_fn(SineNode)]
+fn ln(input: f64) -> f64 {
+	input.sin()
+}
+
+// Cosine
+pub struct CosineNode;
+#[node_macro::node_fn(CosineNode)]
+fn ln(input: f64) -> f64 {
+	input.cos()
+}
+
+// Tangent
+pub struct TangentNode;
+#[node_macro::node_fn(TangentNode)]
+fn ln(input: f64) -> f64 {
+	input.tan()
+}
+
+// Min
+pub struct MinimumNode<Second> {
+	second: Second,
+}
+#[node_macro::node_fn(MinimumNode)]
+fn min<T: core::cmp::PartialOrd>(first: T, second: T) -> T {
+	match first < second {
+		true => first,
+		false => second,
+	}
+}
+
+// Maxi
+pub struct MaximumNode<Second> {
+	second: Second,
+}
+#[node_macro::node_fn(MaximumNode)]
+fn max<T: core::cmp::PartialOrd>(first: T, second: T) -> T {
+	match first > second {
+		true => first,
+		false => second,
+	}
+}
+
+// Equals
+pub struct EqualsNode<Second> {
+	second: Second,
+}
+#[node_macro::node_fn(EqualsNode)]
+fn eq<T: core::cmp::PartialEq>(first: T, second: T) -> bool {
+	first == second
+}
+
+// Modulo
+pub struct ModuloNode<Second> {
+	second: Second,
+}
+#[node_macro::node_fn(ModuloNode)]
+fn modulo<U, T>(first: U, second: T) -> <U as Rem<T>>::Output
+where
+	U: Rem<T>,
+{
+	first % second
+}
+
+pub struct ConstructVector2<X, Y> {
+	x: X,
+	y: Y,
+}
+#[node_macro::node_fn(ConstructVector2)]
+fn construct_vector2(_primary: (), x: f64, y: f64) -> glam::DVec2 {
+	glam::DVec2::new(x, y)
+}
+
+// Size Of
 #[cfg(feature = "std")]
-pub mod dynamic {
-	use super::*;
-
-	// Unfortunatly we can't impl the AddNode as we get
-	// `upstream crates may add a new impl of trait `core::ops::Add` for type `alloc::boxed::Box<(dyn dyn_any::DynAny<'_> + 'static)>` in future versions`
-	pub struct DynamicAddNode;
-
-	// Alias for a dynamic type
-	pub type Dynamic<'a> = alloc::boxed::Box<dyn dyn_any::DynAny<'a> + 'a>;
-
-	/// Resolves the dynamic types for a dynamic node.
-	///
-	/// Macro uses format `BaseNode => (arg1: u32) (arg1: i32)`
-	macro_rules! resolve_dynamic_types {
-	($node:ident => $(($($arg:ident : $t:ty),*))*) => {
-		$(
-			// Check for each possible set of arguments if their types match the arguments given
-			if $(core::any::TypeId::of::<$t>() == $arg.type_id())&&* {
-				// Cast the arguments and then call the inner node
-				alloc::boxed::Box::new($node.eval(($(*dyn_any::downcast::<$t>($arg).unwrap()),*)) ) as Dynamic
-			}
-		)else*
-		else{
-			panic!("Unhandled type"); // TODO: Exit neatly (although this should probably not happen)
-		}
-	};
+struct SizeOfNode;
+#[cfg(feature = "std")]
+#[node_macro::node_fn(SizeOfNode)]
+fn flat_map(ty: crate::Type) -> Option<usize> {
+	ty.size()
 }
 
-	impl<'n> Node<(Dynamic<'n>, Dynamic<'n>)> for DynamicAddNode {
-		type Output = Dynamic<'n>;
-		fn eval(self, (left, right): (Dynamic, Dynamic)) -> Self::Output {
-			resolve_dynamic_types! { AddNode =>
-			(left: usize, right: usize)
-			(left: u8, right: u8)
-			(left: u16, right: u16)
-			(left: u32, right: u32)
-			(left: u64, right: u64)
-			(left: u128, right: u128)
-			(left: isize, right: isize)
-			(left: i8, right: i8)
-			(left: i16, right: i16)
-			(left: i32, right: i32)
-			(left: i64, right: i64)
-			(left: i128, right: i128)
-			(left: f32, right: f32)
-			(left: f64, right: f64) }
-		}
-	}
+// Some
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SomeNode;
+#[node_macro::node_fn(SomeNode)]
+fn some<T>(input: T) -> Option<T> {
+	Some(input)
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CloneNode;
-impl<'n, O: Clone> Node<&'n O> for CloneNode {
+// Clone
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct CloneNode<O>(PhantomData<O>);
+impl<'i, 'n: 'i, O: Clone + 'i> Node<'i, &'n O> for CloneNode<O> {
 	type Output = O;
-	fn eval(self, input: &'n O) -> Self::Output {
+	fn eval(&'i self, input: &'i O) -> Self::Output {
 		input.clone()
 	}
 }
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FstNode;
-impl<'n, T: 'n, U> Node<(T, U)> for FstNode {
-	type Output = T;
-	fn eval(self, input: (T, U)) -> Self::Output {
-		let (a, _) = input;
-		a
-	}
-}
-impl<'n, T: 'n, U> Node<&'n (T, U)> for FstNode {
-	type Output = &'n T;
-	fn eval(self, input: &'n (T, U)) -> Self::Output {
-		let (a, _) = input;
-		a
+impl<O> CloneNode<O> {
+	pub const fn new() -> Self {
+		Self(PhantomData)
 	}
 }
 
-/// Destructures a Tuple of two values and returns the first one
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SndNode;
-impl<'n, T, U: 'n> Node<(T, U)> for SndNode {
-	type Output = U;
-	fn eval(self, input: (T, U)) -> Self::Output {
-		let (_, b) = input;
-		b
+// First of Pair
+/// Return the first element of a 2-tuple
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct FirstOfPairNode;
+impl<'i, L: 'i, R: 'i> Node<'i, (L, R)> for FirstOfPairNode {
+	type Output = L;
+	fn eval(&'i self, input: (L, R)) -> Self::Output {
+		input.0
+	}
+}
+impl FirstOfPairNode {
+	pub fn new() -> Self {
+		Self
 	}
 }
 
-impl<'n, T, U: 'n> Node<&'n (T, U)> for SndNode {
-	type Output = &'n U;
-	fn eval(self, input: &'n (T, U)) -> Self::Output {
-		let (_, b) = input;
-		b
+// Second of Pair
+/// Return the second element of a 2-tuple
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SecondOfPairNode;
+impl<'i, L: 'i, R: 'i> Node<'i, (L, R)> for SecondOfPairNode {
+	type Output = R;
+	fn eval(&'i self, input: (L, R)) -> Self::Output {
+		input.1
+	}
+}
+impl SecondOfPairNode {
+	pub fn new() -> Self {
+		Self
 	}
 }
 
-/// Destructures a Tuple of two values and returns them in reverse order
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SwapNode;
-impl<'n, T: 'n, U: 'n> Node<(T, U)> for SwapNode {
-	type Output = (U, T);
-	fn eval(self, input: (T, U)) -> Self::Output {
-		let (a, b) = input;
-		(b, a)
+// Swap Pair
+/// Return a new 2-tuple with the elements reversed
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SwapPairNode;
+impl<'i, L: 'i, R: 'i> Node<'i, (L, R)> for SwapPairNode {
+	type Output = (R, L);
+	fn eval(&'i self, input: (L, R)) -> Self::Output {
+		(input.1, input.0)
+	}
+}
+impl SwapPairNode {
+	pub fn new() -> Self {
+		Self
 	}
 }
 
-impl<'n, T, U: 'n> Node<&'n (T, U)> for SwapNode {
-	type Output = (&'n U, &'n T);
-	fn eval(self, input: &'n (T, U)) -> Self::Output {
-		let (a, b) = input;
-		(b, a)
-	}
-}
-
-/// Return a tuple with two instances of the input argument
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DupNode;
-impl<'n, T: Clone + 'n> Node<T> for DupNode {
-	type Output = (T, T);
-	fn eval(self, input: T) -> Self::Output {
+// Make Pair
+/// Return a 2-tuple with two duplicates of the input argument
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct MakePairNode;
+impl<'i, O: Clone + 'i> Node<'i, O> for MakePairNode {
+	type Output = (O, O);
+	fn eval(&'i self, input: O) -> Self::Output {
 		(input.clone(), input)
 	}
 }
+impl MakePairNode {
+	pub fn new() -> Self {
+		Self
+	}
+}
 
-/// Return the Input Argument
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct IdNode;
-impl<T> Node<T> for IdNode {
-	type Output = T;
-	fn eval(self, input: T) -> Self::Output {
+// Identity
+/// Return the input argument unchanged
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct IdentityNode;
+impl<'i, O: 'i> Node<'i, O> for IdentityNode {
+	type Output = O;
+	fn eval(&'i self, input: O) -> Self::Output {
 		input
 	}
 }
-impl<'n, T> Node<T> for &'n IdNode {
-	type Output = T;
-	fn eval(self, input: T) -> Self::Output {
-		input
-	}
-}
-impl<T> RefNode<T> for IdNode {
-	type Output = T;
-	fn eval_ref(&self, input: T) -> Self::Output {
-		input
+impl IdentityNode {
+	pub fn new() -> Self {
+		Self
 	}
 }
 
-pub struct MapResultNode<MN, I, E>(pub MN, pub PhantomData<(I, E)>);
-
-impl<MN: Node<I>, I, E> Node<Result<I, E>> for MapResultNode<MN, I, E> {
-	type Output = Result<MN::Output, E>;
-	fn eval(self, input: Result<I, E>) -> Self::Output {
-		input.map(|x| self.0.eval(x))
+// Type
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct TypeNode<N: for<'a> Node<'a, I>, I, O>(pub N, pub PhantomData<(I, O)>);
+impl<'i, N, I: 'i, O: 'i> Node<'i, I> for TypeNode<N, I, O>
+where
+	N: for<'n> Node<'n, I, Output = O>,
+{
+	type Output = O;
+	fn eval(&'i self, input: I) -> Self::Output {
+		self.0.eval(input)
 	}
 }
-impl<'n, MN: Node<I> + Copy, I, E> Node<Result<I, E>> for &'n MapResultNode<MN, I, E> {
-	type Output = Result<MN::Output, E>;
-	fn eval(self, input: Result<I, E>) -> Self::Output {
-		input.map(|x| self.0.eval(x))
+impl<'i, N: for<'a> Node<'a, I>, I: 'i> TypeNode<N, I, <N as Node<'i, I>>::Output> {
+	pub fn new(node: N) -> Self {
+		Self(node, PhantomData)
+	}
+}
+impl<'i, N: for<'a> Node<'a, I> + Clone, I: 'i> Clone for TypeNode<N, I, <N as Node<'i, I>>::Output> {
+	fn clone(&self) -> Self {
+		Self(self.0.clone(), self.1)
+	}
+}
+impl<'i, N: for<'a> Node<'a, I> + Copy, I: 'i> Copy for TypeNode<N, I, <N as Node<'i, I>>::Output> {}
+
+// Map Result
+pub struct MapResultNode<I, E, Mn> {
+	node: Mn,
+	_i: PhantomData<I>,
+	_e: PhantomData<E>,
+}
+#[node_macro::node_fn(MapResultNode<_I,  _E>)]
+fn flat_map<_I, _E, N>(input: Result<_I, _E>, node: &'input N) -> Result<<N as Node<'input, _I>>::Output, _E>
+where
+	N: for<'a> Node<'a, _I>,
+{
+	input.map(|x| node.eval(x))
+}
+
+// Flat Map Result
+pub struct FlatMapResultNode<I, O, E, Mn> {
+	node: Mn,
+	_i: PhantomData<I>,
+	_o: PhantomData<O>,
+	_e: PhantomData<E>,
+}
+#[node_macro::node_fn(FlatMapResultNode<_I, _O, _E>)]
+fn flat_map<_I, _O, _E, N>(input: Result<_I, _E>, node: &'input N) -> Result<_O, _E>
+where
+	N: for<'a> Node<'a, _I, Output = Result<_O, _E>>,
+{
+	match input.map(|x| node.eval(x)) {
+		Ok(Ok(x)) => Ok(x),
+		Ok(Err(e)) => Err(e),
+		Err(e) => Err(e),
 	}
 }
 
-impl<MN, I, E> MapResultNode<MN, I, E> {
-	pub const fn new(mn: MN) -> Self {
-		Self(mn, PhantomData)
-	}
+// Into
+pub struct IntoNode<I, O> {
+	_i: PhantomData<I>,
+	_o: PhantomData<O>,
 }
-pub struct FlatMapResultNode<MN: Node<I>, I, E>(pub MN, pub PhantomData<(I, E)>);
-
-impl<'n, MN: Node<I, Output = Result<O, E>>, I, O: 'n, E: 'n> Node<Result<I, E>> for FlatMapResultNode<MN, I, E> {
-	type Output = Result<O, E>;
-	fn eval(self, input: Result<I, E>) -> Self::Output {
-		match input.map(|x| self.0.eval(x)) {
-			Ok(Ok(x)) => Ok(x),
-			Ok(Err(e)) => Err(e),
-			Err(e) => Err(e),
-		}
-	}
-}
-
-impl<MN: Node<I>, I, E> FlatMapResultNode<MN, I, E> {
-	pub const fn new(mn: MN) -> Self {
-		Self(mn, PhantomData)
-	}
+#[cfg(feature = "alloc")]
+#[node_macro::node_fn(IntoNode<_I, _O>)]
+async fn into<_I, _O>(input: _I) -> _O
+where
+	_I: Into<_O>,
+{
+	input.into()
 }
 
 #[cfg(test)]
@@ -222,38 +390,70 @@ mod test {
 	use crate::{generic::*, structural::*, value::*};
 
 	#[test]
-	pub fn dup_node() {
+	pub fn duplicate_node() {
 		let value = ValueNode(4u32);
-		let dup = value.then(DupNode);
-		assert_eq!(dup.eval(()), (4, 4));
+		let pair = ComposeNode::new(value, MakePairNode::new());
+		assert_eq!(pair.eval(()), (&4, &4));
 	}
 	#[test]
-	pub fn id_node() {
-		let value = ValueNode(4u32).then(IdNode);
-		assert_eq!(value.eval(()), 4);
+	pub fn identity_node() {
+		let value = ValueNode(4u32).then(IdentityNode::new());
+		assert_eq!(value.eval(()), &4);
 	}
 	#[test]
 	pub fn clone_node() {
-		let cloned = (&ValueNode(4u32)).then(CloneNode);
+		let cloned = ValueNode(4u32).then(CloneNode::new());
 		assert_eq!(cloned.eval(()), 4);
+		let type_erased = &CloneNode::new() as &dyn for<'a> Node<'a, &'a u32, Output = u32>;
+		assert_eq!(type_erased.eval(&4), 4);
+		let type_erased = &cloned as &dyn for<'a> Node<'a, (), Output = u32>;
+		assert_eq!(type_erased.eval(()), 4);
 	}
 	#[test]
-	pub fn fst_node() {
-		let fst = ValueNode((4u32, "a")).then(FstNode);
-		assert_eq!(fst.eval(()), 4);
+	pub fn first_node() {
+		let first_of_pair = ValueNode((4u32, "a")).then(CloneNode::new()).then(FirstOfPairNode::new());
+		assert_eq!(first_of_pair.eval(()), 4);
 	}
 	#[test]
-	pub fn snd_node() {
-		let fst = ValueNode((4u32, "a")).then(SndNode);
-		assert_eq!(fst.eval(()), "a");
+	pub fn second_node() {
+		let second_of_pair = ValueNode((4u32, "a")).then(CloneNode::new()).then(SecondOfPairNode::new());
+		assert_eq!(second_of_pair.eval(()), "a");
+	}
+	#[test]
+	pub fn object_safe() {
+		let second_of_pair = ValueNode((4u32, "a")).then(CloneNode::new()).then(SecondOfPairNode::new());
+		let foo = &second_of_pair as &dyn Node<(), Output = &str>;
+		assert_eq!(foo.eval(()), "a");
+	}
+	#[test]
+	pub fn map_result() {
+		let value: ClonedNode<Result<&u32, ()>> = ClonedNode(Ok(&4u32));
+		assert_eq!(value.eval(()), Ok(&4u32));
+		// let type_erased_clone = clone as &dyn for<'a> Node<'a, &'a u32, Output = u32>;
+		let map_result = MapResultNode::new(ValueNode::new(FnNode::new(|x: &u32| *x)));
+		// let type_erased = &map_result as &dyn for<'a> Node<'a, Result<&'a u32, ()>, Output = Result<u32, ()>>;
+		assert_eq!(map_result.eval(Ok(&4u32)), Ok(4u32));
+		let fst = value.then(map_result);
+		// let type_erased = &fst as &dyn for<'a> Node<'a, (), Output = Result<u32, ()>>;
+		assert_eq!(fst.eval(()), Ok(4u32));
+	}
+	#[test]
+	pub fn flat_map_result() {
+		let fst = ValueNode(Ok(&4u32)).then(CloneNode::new());
+		let fn_node: FnNode<_, &u32, Result<&u32, _>> = FnNode::new(|_| Err(8u32));
+		assert_eq!(fn_node.eval(&4u32), Err(8u32));
+		let flat_map = FlatMapResultNode::new(ValueNode::new(fn_node));
+		let fst = fst.then(flat_map);
+		assert_eq!(fst.eval(()), Err(8u32));
 	}
 	#[test]
 	pub fn add_node() {
 		let a = ValueNode(42u32);
 		let b = ValueNode(6u32);
-		let cons_a = ConsNode(a, PhantomData);
+		let cons_a = ConsNode::new(a);
+		let tuple = b.then(cons_a);
 
-		let sum = b.then(cons_a).then(AddNode);
+		let sum = tuple.then(AddPairNode::new());
 
 		assert_eq!(sum.eval(()), 48);
 	}
@@ -268,7 +468,7 @@ mod test {
 		let fnn = FnNode::new(&swap);
 		let fns = FnNodeWithState::new(int, 42u32);
 		assert_eq!(fnn.eval((1u32, 2u32)), (2, 1));
-		let result: u32 = (&fns).eval(());
+		let result: u32 = fns.eval(());
 		assert_eq!(result, 42);
 	}
 }

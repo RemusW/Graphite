@@ -1,95 +1,97 @@
 use crate::messages::frontend::utility_types::{ExportBounds, FileType};
-use crate::messages::layout::utility_types::layout_widget::{Layout, LayoutGroup, PropertyHolder, Widget, WidgetCallback, WidgetHolder, WidgetLayout};
-use crate::messages::layout::utility_types::misc::LayoutTarget;
-use crate::messages::layout::utility_types::widgets::button_widgets::TextButton;
-use crate::messages::layout::utility_types::widgets::input_widgets::{DropdownEntryData, DropdownInput, NumberInput, RadioEntryData, RadioInput, TextInput};
-use crate::messages::layout::utility_types::widgets::label_widgets::{Separator, SeparatorDirection, SeparatorType, TextLabel};
+use crate::messages::layout::utility_types::widget_prelude::*;
+use crate::messages::portfolio::document::utility_types::document_metadata::LayerNodeIdentifier;
 use crate::messages::prelude::*;
 
-use graphene::LayerId;
+pub struct ExportDialogMessageData<'a> {
+	pub portfolio: &'a PortfolioMessageHandler,
+}
 
 /// A dialog to allow users to customize their file export.
 #[derive(Debug, Clone, Default)]
 pub struct ExportDialogMessageHandler {
-	pub file_name: String,
 	pub file_type: FileType,
 	pub scale_factor: f64,
 	pub bounds: ExportBounds,
-	pub artboards: HashMap<LayerId, String>,
+	pub transparent_background: bool,
+	pub artboards: HashMap<LayerNodeIdentifier, String>,
 	pub has_selection: bool,
 }
 
-impl MessageHandler<ExportDialogMessage, ()> for ExportDialogMessageHandler {
-	fn process_message(&mut self, message: ExportDialogMessage, _data: (), responses: &mut VecDeque<Message>) {
+impl MessageHandler<ExportDialogMessage, ExportDialogMessageData<'_>> for ExportDialogMessageHandler {
+	fn process_message(&mut self, message: ExportDialogMessage, responses: &mut VecDeque<Message>, data: ExportDialogMessageData) {
+		let ExportDialogMessageData { portfolio } = data;
+
 		match message {
-			ExportDialogMessage::FileName(name) => self.file_name = name,
 			ExportDialogMessage::FileType(export_type) => self.file_type = export_type,
-			ExportDialogMessage::ScaleFactor(x) => self.scale_factor = x,
+			ExportDialogMessage::ScaleFactor(factor) => self.scale_factor = factor,
+			ExportDialogMessage::TransparentBackground(transparent_background) => self.transparent_background = transparent_background,
 			ExportDialogMessage::ExportBounds(export_area) => self.bounds = export_area,
 
-			ExportDialogMessage::Submit => responses.push_front(
-				DocumentMessage::ExportDocument {
-					file_name: self.file_name.clone(),
-					file_type: self.file_type,
-					scale_factor: self.scale_factor,
-					bounds: self.bounds,
-				}
-				.into(),
-			),
+			ExportDialogMessage::Submit => responses.add_front(PortfolioMessage::SubmitDocumentExport {
+				file_name: portfolio.active_document().map(|document| document.name.clone()).unwrap_or_default(),
+				file_type: self.file_type,
+				scale_factor: self.scale_factor,
+				bounds: self.bounds,
+				transparent_background: self.file_type != FileType::Jpg && self.transparent_background,
+			}),
 		}
 
-		self.register_properties(responses, LayoutTarget::DialogDetails);
+		self.send_dialog_to_frontend(responses);
 	}
 
 	advertise_actions! {ExportDialogUpdate;}
 }
 
-impl PropertyHolder for ExportDialogMessageHandler {
-	fn properties(&self) -> Layout {
-		let file_name = vec![
-			WidgetHolder::new(Widget::TextLabel(TextLabel {
-				value: "File Name".into(),
-				table_align: true,
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Unrelated,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::TextInput(TextInput {
-				value: self.file_name.clone(),
-				on_update: WidgetCallback::new(|text_input: &TextInput| ExportDialogMessage::FileName(text_input.value.clone()).into()),
-				..Default::default()
-			})),
+impl DialogLayoutHolder for ExportDialogMessageHandler {
+	const ICON: &'static str = "File";
+	const TITLE: &'static str = "Export";
+
+	fn layout_buttons(&self) -> Layout {
+		let widgets = vec![
+			TextButton::new("Export")
+				.emphasized(true)
+				.on_update(|_| {
+					DialogMessage::CloseDialogAndThen {
+						followups: vec![ExportDialogMessage::Submit.into()],
+					}
+					.into()
+				})
+				.widget_holder(),
+			TextButton::new("Cancel").on_update(|_| FrontendMessage::DisplayDialogDismiss.into()).widget_holder(),
 		];
 
+		Layout::WidgetLayout(WidgetLayout::new(vec![LayoutGroup::Row { widgets }]))
+	}
+}
+
+impl LayoutHolder for ExportDialogMessageHandler {
+	fn layout(&self) -> Layout {
 		let entries = [(FileType::Png, "PNG"), (FileType::Jpg, "JPG"), (FileType::Svg, "SVG")]
 			.into_iter()
-			.map(|(val, name)| RadioEntryData {
-				label: name.into(),
-				on_update: WidgetCallback::new(move |_| ExportDialogMessage::FileType(val).into()),
-				..RadioEntryData::default()
-			})
+			.map(|(val, name)| RadioEntryData::new(format!("{val:?}")).label(name).on_update(move |_| ExportDialogMessage::FileType(val).into()))
 			.collect();
 
 		let export_type = vec![
-			WidgetHolder::new(Widget::TextLabel(TextLabel {
-				value: "File Type".into(),
-				table_align: true,
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Unrelated,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::RadioInput(RadioInput {
-				selected_index: self.file_type as u32,
-				entries,
-				..Default::default()
-			})),
+			TextLabel::new("File Type").table_align(true).min_width(100).widget_holder(),
+			Separator::new(SeparatorType::Unrelated).widget_holder(),
+			RadioInput::new(entries).selected_index(Some(self.file_type as u32)).widget_holder(),
 		];
 
-		let artboards = self.artboards.iter().map(|(&val, name)| (ExportBounds::Artboard(val), name.to_string(), false));
+		let resolution = vec![
+			TextLabel::new("Scale Factor").table_align(true).min_width(100).widget_holder(),
+			Separator::new(SeparatorType::Unrelated).widget_holder(),
+			NumberInput::new(Some(self.scale_factor))
+				.unit("")
+				.min(0.)
+				.max((1_u64 << std::f64::MANTISSA_DIGITS) as f64)
+				.disabled(self.file_type == FileType::Svg)
+				.on_update(|number_input: &NumberInput| ExportDialogMessage::ScaleFactor(number_input.value.unwrap()).into())
+				.min_width(200)
+				.widget_holder(),
+		];
+
+		let artboards = self.artboards.iter().map(|(&layer, name)| (ExportBounds::Artboard(layer), name.to_string(), false));
 		let mut export_area_options = vec![
 			(ExportBounds::AllArtwork, "All Artwork".to_string(), false),
 			(ExportBounds::Selection, "Selection".to_string(), !self.has_selection),
@@ -98,86 +100,34 @@ impl PropertyHolder for ExportDialogMessageHandler {
 		let index = export_area_options.iter().position(|(val, _, _)| val == &self.bounds).unwrap();
 		let entries = vec![export_area_options
 			.into_iter()
-			.map(|(val, name, disabled)| DropdownEntryData {
-				label: name,
-				on_update: WidgetCallback::new(move |_| ExportDialogMessage::ExportBounds(val).into()),
-				disabled,
-				..Default::default()
+			.map(|(val, name, disabled)| {
+				MenuListEntry::new(format!("{val:?}"))
+					.label(name)
+					.on_commit(move |_| ExportDialogMessage::ExportBounds(val).into())
+					.disabled(disabled)
 			})
 			.collect()];
 
 		let export_area = vec![
-			WidgetHolder::new(Widget::TextLabel(TextLabel {
-				value: "Bounds".into(),
-				table_align: true,
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Unrelated,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::DropdownInput(DropdownInput {
-				selected_index: Some(index as u32),
-				entries,
-				..Default::default()
-			})),
+			TextLabel::new("Bounds").table_align(true).min_width(100).widget_holder(),
+			Separator::new(SeparatorType::Unrelated).widget_holder(),
+			DropdownInput::new(entries).selected_index(Some(index as u32)).widget_holder(),
 		];
 
-		let resolution = vec![
-			WidgetHolder::new(Widget::TextLabel(TextLabel {
-				value: "Scale Factor".into(),
-				table_align: true,
-				..TextLabel::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Unrelated,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::NumberInput(NumberInput {
-				value: Some(self.scale_factor),
-				label: "".into(),
-				unit: " ".into(),
-				min: Some(0.),
-				disabled: self.file_type == FileType::Svg,
-				on_update: WidgetCallback::new(|number_input: &NumberInput| ExportDialogMessage::ScaleFactor(number_input.value.unwrap()).into()),
-				..NumberInput::default()
-			})),
-		];
-
-		let button_widgets = vec![
-			WidgetHolder::new(Widget::TextButton(TextButton {
-				label: "Export".to_string(),
-				min_width: 96,
-				emphasized: true,
-				on_update: WidgetCallback::new(|_| {
-					DialogMessage::CloseDialogAndThen {
-						followups: vec![ExportDialogMessage::Submit.into()],
-					}
-					.into()
-				}),
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::TextButton(TextButton {
-				label: "Cancel".to_string(),
-				min_width: 96,
-				on_update: WidgetCallback::new(|_| FrontendMessage::DisplayDialogDismiss.into()),
-				..Default::default()
-			})),
+		let transparent_background = vec![
+			TextLabel::new("Transparency").table_align(true).min_width(100).widget_holder(),
+			Separator::new(SeparatorType::Unrelated).widget_holder(),
+			CheckboxInput::new(self.transparent_background)
+				.disabled(self.file_type == FileType::Jpg)
+				.on_update(move |value: &CheckboxInput| ExportDialogMessage::TransparentBackground(value.checked).into())
+				.widget_holder(),
 		];
 
 		Layout::WidgetLayout(WidgetLayout::new(vec![
-			LayoutGroup::Row {
-				widgets: vec![WidgetHolder::new(Widget::TextLabel(TextLabel {
-					value: "Export".to_string(),
-					bold: true,
-					..Default::default()
-				}))],
-			},
-			LayoutGroup::Row { widgets: file_name },
 			LayoutGroup::Row { widgets: export_type },
 			LayoutGroup::Row { widgets: resolution },
 			LayoutGroup::Row { widgets: export_area },
-			LayoutGroup::Row { widgets: button_widgets },
+			LayoutGroup::Row { widgets: transparent_background },
 		]))
 	}
 }

@@ -1,11 +1,10 @@
-use crate::messages::layout::utility_types::layout_widget::{Layout, LayoutGroup, PropertyHolder, Widget, WidgetCallback, WidgetHolder, WidgetLayout};
-use crate::messages::layout::utility_types::misc::LayoutTarget;
-use crate::messages::layout::utility_types::widgets::button_widgets::TextButton;
-use crate::messages::layout::utility_types::widgets::input_widgets::{CheckboxInput, NumberInput, TextInput};
-use crate::messages::layout::utility_types::widgets::label_widgets::{Separator, SeparatorDirection, SeparatorType, TextLabel};
+use crate::messages::layout::utility_types::widget_prelude::*;
 use crate::messages::prelude::*;
 
-use glam::UVec2;
+use graph_craft::document::NodeId;
+use graphene_core::uuid::generate_uuid;
+
+use glam::{DVec2, IVec2, UVec2};
 
 /// A dialog to allow users to set some initial options about a new document.
 #[derive(Debug, Clone, Default)]
@@ -16,143 +15,109 @@ pub struct NewDocumentDialogMessageHandler {
 }
 
 impl MessageHandler<NewDocumentDialogMessage, ()> for NewDocumentDialogMessageHandler {
-	fn process_message(&mut self, message: NewDocumentDialogMessage, _data: (), responses: &mut VecDeque<Message>) {
+	fn process_message(&mut self, message: NewDocumentDialogMessage, responses: &mut VecDeque<Message>, _data: ()) {
 		match message {
 			NewDocumentDialogMessage::Name(name) => self.name = name,
 			NewDocumentDialogMessage::Infinite(infinite) => self.infinite = infinite,
 			NewDocumentDialogMessage::DimensionsX(x) => self.dimensions.x = x as u32,
 			NewDocumentDialogMessage::DimensionsY(y) => self.dimensions.y = y as u32,
-
 			NewDocumentDialogMessage::Submit => {
-				responses.push_back(PortfolioMessage::NewDocumentWithName { name: self.name.clone() }.into());
+				responses.add(PortfolioMessage::NewDocumentWithName { name: self.name.clone() });
 
-				if !self.infinite && self.dimensions.x > 0 && self.dimensions.y > 0 {
-					responses.push_back(
-						ArtboardMessage::AddArtboard {
-							id: None,
-							position: (0., 0.),
-							size: (self.dimensions.x as f64, self.dimensions.y as f64),
-						}
-						.into(),
-					);
-					responses.push_back(DocumentMessage::ZoomCanvasToFitAll.into());
+				let create_artboard = !self.infinite && self.dimensions.x > 0 && self.dimensions.y > 0;
+				if create_artboard {
+					let id = NodeId(generate_uuid());
+					responses.add(GraphOperationMessage::NewArtboard {
+						id,
+						artboard: graphene_core::Artboard::new(IVec2::ZERO, self.dimensions.as_ivec2()),
+					});
+					responses.add(NavigationMessage::FitViewportToBounds {
+						bounds: [DVec2::ZERO, self.dimensions.as_dvec2()],
+						prevent_zoom_past_100: true,
+					});
 				}
+				responses.add(NodeGraphMessage::RunDocumentGraph);
+				responses.add(NodeGraphMessage::UpdateNewNodeGraph);
 			}
 		}
 
-		self.register_properties(responses, LayoutTarget::DialogDetails);
+		self.send_dialog_to_frontend(responses);
 	}
 
 	advertise_actions! {NewDocumentDialogUpdate;}
 }
 
-impl PropertyHolder for NewDocumentDialogMessageHandler {
-	fn properties(&self) -> Layout {
-		let title = vec![WidgetHolder::new(Widget::TextLabel(TextLabel {
-			value: "New document".into(),
-			bold: true,
-			..Default::default()
-		}))];
+impl DialogLayoutHolder for NewDocumentDialogMessageHandler {
+	const ICON: &'static str = "File";
+	const TITLE: &'static str = "New Document";
 
-		let name = vec![
-			WidgetHolder::new(Widget::TextLabel(TextLabel {
-				value: "Name".into(),
-				table_align: true,
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Unrelated,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::TextInput(TextInput {
-				value: self.name.clone(),
-				on_update: WidgetCallback::new(|text_input: &TextInput| NewDocumentDialogMessage::Name(text_input.value.clone()).into()),
-				..Default::default()
-			})),
-		];
-
-		let infinite = vec![
-			WidgetHolder::new(Widget::TextLabel(TextLabel {
-				value: "Infinite Canvas".into(),
-				table_align: true,
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Unrelated,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::CheckboxInput(CheckboxInput {
-				checked: self.infinite,
-				on_update: WidgetCallback::new(|checkbox_input: &CheckboxInput| NewDocumentDialogMessage::Infinite(checkbox_input.checked).into()),
-				..Default::default()
-			})),
-		];
-
-		let scale = vec![
-			WidgetHolder::new(Widget::TextLabel(TextLabel {
-				value: "Dimensions".into(),
-				table_align: true,
-				..TextLabel::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Unrelated,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::NumberInput(NumberInput {
-				label: "W".into(),
-				unit: " px".into(),
-				value: Some(self.dimensions.x as f64),
-				min: Some(0.),
-				is_integer: true,
-				disabled: self.infinite,
-				min_width: 100,
-				on_update: WidgetCallback::new(|number_input: &NumberInput| NewDocumentDialogMessage::DimensionsX(number_input.value.unwrap()).into()),
-				..NumberInput::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Related,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::NumberInput(NumberInput {
-				label: "H".into(),
-				unit: " px".into(),
-				value: Some(self.dimensions.y as f64),
-				min: Some(0.),
-				is_integer: true,
-				disabled: self.infinite,
-				min_width: 100,
-				on_update: WidgetCallback::new(|number_input: &NumberInput| NewDocumentDialogMessage::DimensionsY(number_input.value.unwrap()).into()),
-				..NumberInput::default()
-			})),
-		];
-
-		let button_widgets = vec![
-			WidgetHolder::new(Widget::TextButton(TextButton {
-				label: "OK".to_string(),
-				min_width: 96,
-				emphasized: true,
-				on_update: WidgetCallback::new(|_| {
+	fn layout_buttons(&self) -> Layout {
+		let widgets = vec![
+			TextButton::new("OK")
+				.emphasized(true)
+				.on_update(|_| {
 					DialogMessage::CloseDialogAndThen {
 						followups: vec![NewDocumentDialogMessage::Submit.into()],
 					}
 					.into()
-				}),
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::TextButton(TextButton {
-				label: "Cancel".to_string(),
-				min_width: 96,
-				on_update: WidgetCallback::new(|_| FrontendMessage::DisplayDialogDismiss.into()),
-				..Default::default()
-			})),
+				})
+				.widget_holder(),
+			TextButton::new("Cancel").on_update(|_| FrontendMessage::DisplayDialogDismiss.into()).widget_holder(),
+		];
+
+		Layout::WidgetLayout(WidgetLayout::new(vec![LayoutGroup::Row { widgets }]))
+	}
+}
+
+impl LayoutHolder for NewDocumentDialogMessageHandler {
+	fn layout(&self) -> Layout {
+		let name = vec![
+			TextLabel::new("Name").table_align(true).min_width(90).widget_holder(),
+			Separator::new(SeparatorType::Unrelated).widget_holder(),
+			TextInput::new(&self.name)
+				.on_update(|text_input: &TextInput| NewDocumentDialogMessage::Name(text_input.value.clone()).into())
+				.min_width(204) // Matches the 100px of both NumberInputs below + the 4px of the Unrelated-type separator
+				.widget_holder(),
+		];
+
+		let infinite = vec![
+			TextLabel::new("Infinite Canvas").table_align(true).min_width(90).widget_holder(),
+			Separator::new(SeparatorType::Unrelated).widget_holder(),
+			CheckboxInput::new(self.infinite)
+				.on_update(|checkbox_input: &CheckboxInput| NewDocumentDialogMessage::Infinite(checkbox_input.checked).into())
+				.widget_holder(),
+		];
+
+		let scale = vec![
+			TextLabel::new("Dimensions").table_align(true).min_width(90).widget_holder(),
+			Separator::new(SeparatorType::Unrelated).widget_holder(),
+			NumberInput::new(Some(self.dimensions.x as f64))
+				.label("W")
+				.unit(" px")
+				.min(0.)
+				.max((1_u64 << std::f64::MANTISSA_DIGITS) as f64)
+				.is_integer(true)
+				.disabled(self.infinite)
+				.min_width(100)
+				.on_update(|number_input: &NumberInput| NewDocumentDialogMessage::DimensionsX(number_input.value.unwrap()).into())
+				.widget_holder(),
+			Separator::new(SeparatorType::Related).widget_holder(),
+			NumberInput::new(Some(self.dimensions.y as f64))
+				.label("H")
+				.unit(" px")
+				.min(0.)
+				.max((1_u64 << std::f64::MANTISSA_DIGITS) as f64)
+				.is_integer(true)
+				.disabled(self.infinite)
+				.min_width(100)
+				.on_update(|number_input: &NumberInput| NewDocumentDialogMessage::DimensionsY(number_input.value.unwrap()).into())
+				.widget_holder(),
 		];
 
 		Layout::WidgetLayout(WidgetLayout::new(vec![
-			LayoutGroup::Row { widgets: title },
 			LayoutGroup::Row { widgets: name },
 			LayoutGroup::Row { widgets: infinite },
 			LayoutGroup::Row { widgets: scale },
-			LayoutGroup::Row { widgets: button_widgets },
 		]))
 	}
 }

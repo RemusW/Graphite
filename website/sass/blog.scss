@@ -1,5 +1,5 @@
 #intro {
-	.section {
+	.block {
 		flex: 1 1 100%;
 		width: 100%;
 
@@ -28,6 +28,7 @@
 
 				.link {
 					vertical-align: top;
+					margin-top: 0;
 				}
 			}
 		}
@@ -37,47 +38,30 @@
 #articles {
 	display: flex;
 	flex-direction: column;
-	gap: 80px;
 
-	article {
+	section {
 		display: flex;
 		gap: 20px 80px;
+		width: 100%;
 
 		@media screen and (max-width: 960px) {
 			flex-wrap: wrap;
 			justify-content: center;
+			flex-direction: column;
 
 			.banner.banner {
 				width: 100%;
-				max-width: 540px;
+				background: var(--color-fog);
+
+				img {
+					margin: auto;
+					max-width: 480px;
+				}
 			}
 		}
 
-		.details {
-			display: flex;
-			flex-direction: column;
-			gap: 20px;
-
-			.headline a {
-				text-decoration: none;
-				color: var(--color-navy);
-			}
-
-			.publication {
-				font-weight: 800;
-			}
-
-			.summary {
-				flex-direction: column;
-				gap: 20px;
-				text-align: justify;
-				hyphens: auto;
-				overflow: hidden;
-				text-overflow: ellipsis;
-				display: -webkit-box;
-				-webkit-box-orient: vertical;
-				-webkit-line-clamp: 3;
-			}
+		~ section {
+			margin-top: calc(120 * var(--variable-px));
 		}
 
 		.banner {
@@ -88,6 +72,51 @@
 				display: block;
 				width: 100%;
 				height: auto;
+			}
+		}
+
+		.details {
+			display: flex;
+			flex-direction: column;
+			gap: 20px;
+			flex: 1 1 auto;
+
+			.headline {
+				margin-top: -0.5em;
+
+				a {
+					font-weight: 700;
+					text-decoration: none;
+					color: var(--color-navy);
+				}
+			}
+
+			.publication {
+				font-weight: 800;
+			}
+
+			.summary {
+				flex-direction: column;
+				gap: 20px;
+				text-align: justify;
+				-webkit-hyphens: auto;
+				hyphens: auto;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				display: -webkit-box;
+				-webkit-box-orient: vertical;
+				-webkit-line-clamp: 3;
+
+				// Safari workaround: https://stackoverflow.com/a/72170897/775283
+				// But there remains an issue where the ellipsis is rendered inside the text. There doesn't appear to be a fix, or even a way to disable the ellipsis in Safari.
+				p {
+					display: inline;
+
+					&::after {
+						content: "\A\A"; // Double new line
+						white-space: pre;
+					}
+				}
 			}
 		}
 	}

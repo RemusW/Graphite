@@ -4,19 +4,26 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = ["dealloc_nodes"]
+serde = ["dep:serde", "graphene-core/serde", "glam/serde", "bezier-rs/serde"]
+dealloc_nodes = []
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-graphene-core = { path = "../gcore", features = ["async", "std"] }
-graphene-std = { path = "../gstd" }
-dyn-any = { path = "../../libraries/dyn-any", features = ["log-bad-types", "rc", "glam"] }
-num-traits = "0.2"
-borrow_stack = { path = "../borrow_stack" }
-dyn-clone = "1.0"
-rand_chacha = "0.3.1"
-log = "0.4"
-serde = { version = "1", features = ["derive", "rc"], optional = true }
-glam = { version = "0.17" }
-
-[features]
-serde = ["dep:serde", "graphene-std/serde", "glam/serde"]
+graphene-core = { workspace = true, features = ["std"] }
+dyn-any = { path = "../../libraries/dyn-any", features = [
+	"log-bad-types",
+	"rc",
+	"glam",
+] }
+num-traits = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true, optional = true }
+glam = { workspace = true }
+base64 = { workspace = true }
+bezier-rs = { workspace = true }
+specta = { workspace = true }
+bytemuck = { workspace = true }
+rustc-hash = { workspace = true }

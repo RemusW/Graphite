@@ -1,24 +1,18 @@
-# Bezier-rs interactive docs
+# Bezier-rs interactive documentation
 
-## Project setup
-```
-npm install
-```
+Open these interactive docs: <https://graphite.rs/libraries/bezier-rs/>
 
-### Compiles and hot-reloads for development
-```
-npm start
-```
+This page also serves isolated demos for iframes used in the Rustdoc [crate documentation](https://docs.rs/bezier-rs/latest/bezier_rs/).
 
-### Compiles and minifies for production
-```
-npm run build
-```
+## Building and running
 
-### Lints and fixes files
-```
-npm run lint
-```
+From this directory, first execute `npm install` to install the required Node dependencies. Then...
 
-### Customize configuration
-See [Configuration Reference](https://cli.vuejs.org/config/).
+- To run the development server with hot reloading:
+  ```
+  npm start
+  ```
+- To compile an optimized production build:
+  ```
+  npm run build
+  ```

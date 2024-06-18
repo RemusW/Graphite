@@ -1,6 +1,4 @@
-use crate::messages::layout::utility_types::layout_widget::{Layout, LayoutGroup, PropertyHolder, Widget, WidgetCallback, WidgetHolder, WidgetLayout};
-use crate::messages::layout::utility_types::widgets::button_widgets::TextButton;
-use crate::messages::layout::utility_types::widgets::label_widgets::TextLabel;
+use crate::messages::layout::utility_types::widget_prelude::*;
 use crate::messages::prelude::*;
 
 /// A dialog to notify users of a non-fatal error.
@@ -9,31 +7,25 @@ pub struct ErrorDialog {
 	pub description: String,
 }
 
-impl PropertyHolder for ErrorDialog {
-	fn properties(&self) -> Layout {
+impl DialogLayoutHolder for ErrorDialog {
+	const ICON: &'static str = "Warning";
+	const TITLE: &'static str = "Error";
+
+	fn layout_buttons(&self) -> Layout {
+		let widgets = vec![TextButton::new("OK").emphasized(true).on_update(|_| FrontendMessage::DisplayDialogDismiss.into()).widget_holder()];
+
+		Layout::WidgetLayout(WidgetLayout::new(vec![LayoutGroup::Row { widgets }]))
+	}
+}
+
+impl LayoutHolder for ErrorDialog {
+	fn layout(&self) -> Layout {
 		Layout::WidgetLayout(WidgetLayout::new(vec![
 			LayoutGroup::Row {
-				widgets: vec![WidgetHolder::new(Widget::TextLabel(TextLabel {
-					value: self.title.clone(),
-					bold: true,
-					..Default::default()
-				}))],
+				widgets: vec![TextLabel::new(&self.title).bold(true).widget_holder()],
 			},
 			LayoutGroup::Row {
-				widgets: vec![WidgetHolder::new(Widget::TextLabel(TextLabel {
-					value: self.description.clone(),
-					multiline: true,
-					..Default::default()
-				}))],
-			},
-			LayoutGroup::Row {
-				widgets: vec![WidgetHolder::new(Widget::TextButton(TextButton {
-					label: "OK".to_string(),
-					emphasized: true,
-					min_width: 96,
-					on_update: WidgetCallback::new(|_| FrontendMessage::DisplayDialogDismiss.into()),
-					..Default::default()
-				}))],
+				widgets: vec![TextLabel::new(&self.description).multiline(true).widget_holder()],
 			},
 		]))
 	}

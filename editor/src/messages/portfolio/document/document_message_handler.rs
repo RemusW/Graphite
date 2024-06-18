@@ -1,595 +1,774 @@
+use super::node_graph::utility_types::Transform;
+use super::utility_types::clipboards::Clipboard;
 use super::utility_types::error::EditorError;
-use super::utility_types::misc::DocumentRenderMode;
-use crate::application::generate_uuid;
-use crate::consts::{ASYMPTOTIC_EFFECT, DEFAULT_DOCUMENT_NAME, FILE_SAVE_SUFFIX, GRAPHITE_DOCUMENT_VERSION, SCALE_EFFECT, SCROLLBAR_SPACING, VIEWPORT_ZOOM_TO_FIT_PADDING_SCALE_FACTOR};
-use crate::messages::frontend::utility_types::ExportBounds;
-use crate::messages::frontend::utility_types::{FileType, FrontendImageData};
+use super::utility_types::misc::{BoundingBoxSnapTarget, GeometrySnapTarget, OptionBoundsSnapping, OptionPointSnapping, SnappingOptions, SnappingState};
+use super::utility_types::nodes::{CollapsedLayers, SelectedNodes};
+use crate::application::{generate_uuid, GRAPHITE_GIT_COMMIT_HASH};
+use crate::consts::{ASYMPTOTIC_EFFECT, DEFAULT_DOCUMENT_NAME, FILE_SAVE_SUFFIX, SCALE_EFFECT, SCROLLBAR_SPACING, VIEWPORT_ROTATE_SNAP_INTERVAL};
 use crate::messages::input_mapper::utility_types::macros::action_keys;
-use crate::messages::layout::utility_types::layout_widget::{Layout, LayoutGroup, Widget, WidgetCallback, WidgetHolder, WidgetLayout};
-use crate::messages::layout::utility_types::misc::LayoutTarget;
-use crate::messages::layout::utility_types::widgets::button_widgets::{IconButton, PopoverButton};
-use crate::messages::layout::utility_types::widgets::input_widgets::{
-	DropdownEntryData, DropdownInput, NumberInput, NumberInputIncrementBehavior, NumberInputMode, OptionalInput, RadioEntryData, RadioInput,
-};
-use crate::messages::layout::utility_types::widgets::label_widgets::{Separator, SeparatorDirection, SeparatorType};
+use crate::messages::layout::utility_types::widget_prelude::*;
+use crate::messages::portfolio::document::graph_operation::utility_types::TransformIn;
+use crate::messages::portfolio::document::node_graph::NodeGraphHandlerData;
+use crate::messages::portfolio::document::overlays::grid_overlays::{grid_overlay, overlay_options};
 use crate::messages::portfolio::document::properties_panel::utility_types::PropertiesPanelMessageHandlerData;
-use crate::messages::portfolio::document::utility_types::clipboards::Clipboard;
-use crate::messages::portfolio::document::utility_types::layer_panel::{LayerMetadata, LayerPanelEntry, RawBuffer};
-use crate::messages::portfolio::document::utility_types::misc::DocumentMode;
-use crate::messages::portfolio::document::utility_types::misc::{AlignAggregate, AlignAxis, DocumentSave, FlipAxis};
-use crate::messages::portfolio::document::utility_types::vectorize_layer_metadata;
+use crate::messages::portfolio::document::utility_types::document_metadata::{is_artboard, DocumentMetadata, LayerNodeIdentifier};
+use crate::messages::portfolio::document::utility_types::misc::{AlignAggregate, AlignAxis, DocumentMode, FlipAxis, PTZ};
+use crate::messages::portfolio::document::utility_types::nodes::RawBuffer;
 use crate::messages::portfolio::utility_types::PersistentData;
 use crate::messages::prelude::*;
+use crate::messages::tool::common_functionality::graph_modification_utils::{get_blend_mode, get_opacity};
+use crate::messages::tool::utility_types::ToolType;
+use crate::node_graph_executor::NodeGraphExecutor;
 
-use graphene::color::Color;
-use graphene::document::{pick_layer_safe_imaginate_resolution, Document as GrapheneDocument};
-use graphene::layers::blend_mode::BlendMode;
-use graphene::layers::folder_layer::FolderLayer;
-use graphene::layers::imaginate_layer::{ImaginateBaseImage, ImaginateGenerationParameters, ImaginateStatus};
-use graphene::layers::layer_info::{LayerDataType, LayerDataTypeDiscriminant};
-use graphene::layers::style::{Fill, RenderData, ViewMode};
-use graphene::layers::text_layer::{Font, FontCache};
-use graphene::{DocumentError, DocumentResponse, LayerId, Operation as DocumentOperation};
-use graphene_std::vector::subpath::Subpath;
+use graph_craft::document::value::TaggedValue;
+use graph_craft::document::FlowType;
+use graph_craft::document::{NodeId, NodeInput, NodeNetwork};
+use graphene_core::raster::BlendMode;
+use graphene_core::raster::ImageFrame;
+use graphene_core::renderer::ClickTarget;
+use graphene_core::vector::style::ViewMode;
+use graphene_std::vector::style::{Fill, FillType, Gradient};
 
-use glam::{DAffine2, DVec2};
-use serde::{Deserialize, Serialize};
+use glam::{DAffine2, DVec2, IVec2};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+use std::vec;
+
+pub struct DocumentMessageData<'a> {
+	pub document_id: DocumentId,
+	pub ipp: &'a InputPreprocessorMessageHandler,
+	pub persistent_data: &'a PersistentData,
+	pub executor: &'a mut NodeGraphExecutor,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DocumentMessageHandler {
-	pub graphene_document: GrapheneDocument,
-	pub saved_document_identifier: u64,
-	pub auto_saved_document_identifier: u64,
-	pub name: String,
-	pub version: String,
-
-	pub document_mode: DocumentMode,
-	pub view_mode: ViewMode,
-	pub snapping_enabled: bool,
-	pub overlays_visible: bool,
-
+	// ======================
+	// Child message handlers
+	// ======================
+	//
 	#[serde(skip)]
-	pub document_undo_history: VecDeque<DocumentSave>,
-	#[serde(skip)]
-	pub document_redo_history: VecDeque<DocumentSave>,
-
-	#[serde(with = "vectorize_layer_metadata")]
-	pub layer_metadata: HashMap<Vec<LayerId>, LayerMetadata>,
-	layer_range_selection_reference: Vec<LayerId>,
-
 	navigation_handler: NavigationMessageHandler,
 	#[serde(skip)]
+	pub node_graph_handler: NodeGraphMessageHandler,
+	#[serde(skip)]
 	overlays_message_handler: OverlaysMessageHandler,
-	pub artboard_message_handler: ArtboardMessageHandler,
 	#[serde(skip)]
-	transform_layer_handler: TransformLayerMessageHandler,
 	properties_panel_message_handler: PropertiesPanelMessageHandler,
+
+	// ============================================
+	// Fields that are saved in the document format
+	// ============================================
+	//
+	/// The node graph that generates this document's artwork.
+	/// It recursively stores its sub-graphs, so this root graph is the whole snapshot of the document content.
+	pub network: NodeNetwork,
+	/// List of the [`NodeId`]s that are currently selected by the user.
+	pub selected_nodes: SelectedNodes,
+	/// List of the [`LayerNodeIdentifier`]s that are currently collapsed by the user in the Layers panel.
+	/// Collapsed means that the expansion arrow isn't set to show the children of these layers.
+	pub collapsed: CollapsedLayers,
+	/// The name of the document, which is displayed in the tab and title bar of the editor.
+	pub name: String,
+	/// The full Git commit hash of the Graphite repository that was used to build the editor.
+	/// We save this to provide a hint about which version of the editor was used to create the document.
+	commit_hash: String,
+	/// The current pan, tilt, and zoom state of the viewport's view of the document canvas.
+	pub navigation: PTZ,
+	/// The current pan, and zoom state of the viewport's view of the node graph.
+	node_graph_transform: PTZ,
+	/// The current mode that the document is in, which starts out as Design Mode. This choice affects the editing behavior of the tools.
+	document_mode: DocumentMode,
+	/// The current view mode that the user has set for rendering the document within the viewport.
+	/// This is usually "Normal" but can be set to "Outline" or "Pixels" to see the canvas differently.
+	pub view_mode: ViewMode,
+	/// Sets whether or not all the viewport overlays should be drawn on top of the artwork.
+	/// This includes tool interaction visualizations (like the transform cage and path anchors/handles), the grid, and more.
+	overlays_visible: bool,
+	/// Sets whether or not the rulers should be drawn along the top and left edges of the viewport area.
+	pub rulers_visible: bool,
+	/// Sets whether or not the node graph is drawn (as an overlay) on top of the viewport area, or otherwise if it's hidden.
+	graph_view_overlay_open: bool,
+	/// The current user choices for snapping behavior, including whether snapping is enabled at all.
+	pub snapping_state: SnappingState,
+
+	// =============================================
+	// Fields omitted from the saved document format
+	// =============================================
+	//
+	/// Stack of document network snapshots for previous history states.
 	#[serde(skip)]
-	node_graph_handler: NodeGraphMessageHandler,
+	document_undo_history: VecDeque<NodeNetwork>,
+	/// Stack of document network snapshots for future history states.
+	#[serde(skip)]
+	document_redo_history: VecDeque<NodeNetwork>,
+	/// Hash of the document snapshot that was most recently saved to disk by the user.
+	#[serde(skip)]
+	saved_hash: Option<u64>,
+	/// Hash of the document snapshot that was most recently auto-saved to the IndexedDB storage that will reopen when the editor is reloaded.
+	#[serde(skip)]
+	auto_saved_hash: Option<u64>,
+	/// Disallow aborting transactions whilst undoing to avoid #559.
+	#[serde(skip)]
+	undo_in_progress: bool,
+	/// The ID of the layer at the start of a range selection in the Layers panel.
+	/// If the user clicks or Ctrl-clicks one layer, it becomes the start of the range selection and then Shift-clicking another layer selects all layers between the start and end.
+	#[serde(skip)]
+	layer_range_selection_reference: Option<LayerNodeIdentifier>,
+	/// Stores stateful information about the document's network such as the graph's structural topology and which layers are hidden, locked, etc.
+	/// This is updated frequently, whenever the information it's derived from changes.
+	#[serde(skip)]
+	pub metadata: DocumentMetadata,
 }
 
 impl Default for DocumentMessageHandler {
 	fn default() -> Self {
 		Self {
-			graphene_document: GrapheneDocument::default(),
-			saved_document_identifier: 0,
-			auto_saved_document_identifier: 0,
-			name: String::from("Untitled Document"),
-			version: GRAPHITE_DOCUMENT_VERSION.to_string(),
-
+			// ======================
+			// Child message handlers
+			// ======================
+			navigation_handler: NavigationMessageHandler::default(),
+			node_graph_handler: NodeGraphMessageHandler::default(),
+			overlays_message_handler: OverlaysMessageHandler::default(),
+			properties_panel_message_handler: PropertiesPanelMessageHandler::default(),
+			// ============================================
+			// Fields that are saved in the document format
+			// ============================================
+			network: root_network(),
+			selected_nodes: SelectedNodes::default(),
+			collapsed: CollapsedLayers::default(),
+			name: DEFAULT_DOCUMENT_NAME.to_string(),
+			commit_hash: GRAPHITE_GIT_COMMIT_HASH.to_string(),
+			navigation: PTZ::default(),
+			node_graph_transform: PTZ::default(),
 			document_mode: DocumentMode::DesignMode,
 			view_mode: ViewMode::default(),
-			snapping_enabled: true,
 			overlays_visible: true,
-
+			rulers_visible: true,
+			graph_view_overlay_open: false,
+			snapping_state: SnappingState::default(),
+			// =============================================
+			// Fields omitted from the saved document format
+			// =============================================
 			document_undo_history: VecDeque::new(),
 			document_redo_history: VecDeque::new(),
-
-			layer_metadata: vec![(vec![], LayerMetadata::new(true))].into_iter().collect(),
-			layer_range_selection_reference: Vec::new(),
-
-			navigation_handler: NavigationMessageHandler::default(),
-			overlays_message_handler: OverlaysMessageHandler::default(),
-			artboard_message_handler: ArtboardMessageHandler::default(),
-			transform_layer_handler: TransformLayerMessageHandler::default(),
-			properties_panel_message_handler: PropertiesPanelMessageHandler::default(),
-			node_graph_handler: Default::default(),
+			saved_hash: None,
+			auto_saved_hash: None,
+			undo_in_progress: false,
+			layer_range_selection_reference: None,
+			metadata: Default::default(),
 		}
 	}
 }
 
-impl MessageHandler<DocumentMessage, (u64, &InputPreprocessorMessageHandler, &PersistentData, &PreferencesMessageHandler)> for DocumentMessageHandler {
-	#[remain::check]
-	fn process_message(
-		&mut self,
-		message: DocumentMessage,
-		(document_id, ipp, persistent_data, preferences): (u64, &InputPreprocessorMessageHandler, &PersistentData, &PreferencesMessageHandler),
-		responses: &mut VecDeque<Message>,
-	) {
-		use DocumentMessage::*;
+impl MessageHandler<DocumentMessage, DocumentMessageData<'_>> for DocumentMessageHandler {
+	fn process_message(&mut self, message: DocumentMessage, responses: &mut VecDeque<Message>, data: DocumentMessageData) {
+		let DocumentMessageData {
+			document_id,
+			ipp,
+			persistent_data,
+			executor,
+		} = data;
 
-		#[remain::sorted]
 		match message {
 			// Sub-messages
-			#[remain::unsorted]
-			DispatchOperation(op) => match self.graphene_document.handle_operation(*op, &persistent_data.font_cache) {
-				Ok(Some(document_responses)) => {
-					for response in document_responses {
-						match &response {
-							DocumentResponse::FolderChanged { path } => responses.push_back(FolderChanged { affected_folder_path: path.clone() }.into()),
-							DocumentResponse::DeletedLayer { path } => {
-								self.layer_metadata.remove(path);
-							}
-							DocumentResponse::LayerChanged { path } => responses.push_back(LayerChanged { affected_layer_path: path.clone() }.into()),
-							DocumentResponse::CreatedLayer { path } => {
-								if self.layer_metadata.contains_key(path) {
-									warn!("CreatedLayer overrides existing layer metadata.");
-								}
-								self.layer_metadata.insert(path.clone(), LayerMetadata::new(false));
+			DocumentMessage::Navigation(message) => {
+				let data = NavigationMessageData {
+					metadata: &self.metadata,
+					ipp,
+					selection_bounds: if self.graph_view_overlay_open {
+						self.selected_nodes_bounding_box_viewport()
+					} else {
+						self.selected_visible_layers_bounding_box_viewport()
+					},
+					ptz: if self.graph_view_overlay_open { &mut self.node_graph_transform } else { &mut self.navigation },
+					graph_view_overlay_open: self.graph_view_overlay_open,
+					document_network: &self.network,
+					node_graph_handler: &self.node_graph_handler,
+				};
 
-								responses.push_back(LayerChanged { affected_layer_path: path.clone() }.into());
-								self.layer_range_selection_reference = path.clone();
-								responses.push_back(
-									AddSelectedLayers {
-										additional_layers: vec![path.clone()],
-									}
-									.into(),
-								);
-							}
-							DocumentResponse::DocumentChanged => responses.push_back(RenderDocument.into()),
-						};
-						responses.push_back(BroadcastEvent::DocumentIsDirty.into());
-					}
-				}
-				Err(e) => error!("DocumentError: {:?}", e),
-				Ok(_) => (),
-			},
-			#[remain::unsorted]
-			Artboard(message) => {
-				self.artboard_message_handler.process_message(message, &persistent_data.font_cache, responses);
+				self.navigation_handler.process_message(message, responses, data);
 			}
-			#[remain::unsorted]
-			Navigation(message) => {
-				self.navigation_handler.process_message(message, (&self.graphene_document, ipp), responses);
+			DocumentMessage::Overlays(message) => {
+				let overlays_visible = self.overlays_visible;
+				self.overlays_message_handler.process_message(message, responses, OverlaysMessageData { overlays_visible, ipp });
 			}
-			#[remain::unsorted]
-			Overlays(message) => {
-				self.overlays_message_handler
-					.process_message(message, (self.overlays_visible, &persistent_data.font_cache, ipp), responses);
-			}
-			#[remain::unsorted]
-			TransformLayer(message) => {
-				self.transform_layer_handler
-					.process_message(message, (&mut self.layer_metadata, &mut self.graphene_document, ipp, &persistent_data.font_cache), responses);
-			}
-			#[remain::unsorted]
-			PropertiesPanel(message) => {
+			DocumentMessage::PropertiesPanel(message) => {
 				let properties_panel_message_handler_data = PropertiesPanelMessageHandlerData {
-					artwork_document: &self.graphene_document,
-					artboard_document: &self.artboard_message_handler.artboards_graphene_document,
-					selected_layers: &mut self.layer_metadata.iter().filter_map(|(path, data)| data.selected.then_some(path.as_slice())),
 					node_graph_message_handler: &self.node_graph_handler,
+					executor,
+					document_name: self.name.as_str(),
+					document_network: &self.network,
+					document_metadata: &mut self.metadata,
+					selected_nodes: &self.selected_nodes,
 				};
 				self.properties_panel_message_handler
-					.process_message(message, (persistent_data, properties_panel_message_handler_data), responses);
+					.process_message(message, responses, (persistent_data, properties_panel_message_handler_data));
 			}
-			#[remain::unsorted]
-			NodeGraph(message) => {
-				self.node_graph_handler.process_message(message, (&mut self.graphene_document, ipp), responses);
+			DocumentMessage::NodeGraph(message) => {
+				self.node_graph_handler.process_message(
+					message,
+					responses,
+					NodeGraphHandlerData {
+						document_network: &mut self.network,
+						document_metadata: &mut self.metadata,
+						selected_nodes: &mut self.selected_nodes,
+						document_id,
+						document_name: self.name.as_str(),
+						collapsed: &mut self.collapsed,
+						ipp,
+						graph_view_overlay_open: self.graph_view_overlay_open,
+					},
+				);
+			}
+			DocumentMessage::GraphOperation(message) => {
+				let data = GraphOperationMessageData {
+					document_network: &mut self.network,
+					document_metadata: &mut self.metadata,
+					selected_nodes: &mut self.selected_nodes,
+					collapsed: &mut self.collapsed,
+					node_graph: &mut self.node_graph_handler,
+				};
+				let mut graph_operation_message_handler = GraphOperationMessageHandler {};
+				graph_operation_message_handler.process_message(message, responses, data);
 			}
 
 			// Messages
-			AbortTransaction => {
-				self.undo(responses).unwrap_or_else(|e| warn!("{}", e));
-				responses.extend([RenderDocument.into(), DocumentStructureChanged.into()]);
-			}
-			AddSelectedLayers { additional_layers } => {
-				for layer_path in &additional_layers {
-					responses.extend(self.select_layer(layer_path, &persistent_data.font_cache));
+			DocumentMessage::AbortTransaction => {
+				if !self.undo_in_progress {
+					self.undo(responses);
+					responses.add(OverlaysMessage::Draw);
 				}
-
-				// TODO: Correctly update layer panel in clear_selection instead of here
-				responses.push_back(FolderChanged { affected_folder_path: vec![] }.into());
-				responses.push_back(BroadcastEvent::SelectionChanged.into());
-
-				self.update_layer_tree_options_bar_widgets(responses, &persistent_data.font_cache);
 			}
-			AlignSelectedLayers { axis, aggregate } => {
+			DocumentMessage::AlignSelectedLayers { axis, aggregate } => {
 				self.backup(responses);
-				let (paths, boxes): (Vec<_>, Vec<_>) = self
-					.selected_layers()
-					.filter_map(|path| self.graphene_document.viewport_bounding_box(path, &persistent_data.font_cache).ok()?.map(|b| (path, b)))
-					.unzip();
 
 				let axis = match axis {
 					AlignAxis::X => DVec2::X,
 					AlignAxis::Y => DVec2::Y,
 				};
-				let lerp = |bbox: &[DVec2; 2]| bbox[0].lerp(bbox[1], 0.5);
-				if let Some(combined_box) = self.graphene_document.combined_viewport_bounding_box(self.selected_layers(), &persistent_data.font_cache) {
-					let aggregated = match aggregate {
-						AlignAggregate::Min => combined_box[0],
-						AlignAggregate::Max => combined_box[1],
-						AlignAggregate::Center => lerp(&combined_box),
-						AlignAggregate::Average => boxes.iter().map(|b| lerp(b)).reduce(|a, b| a + b).map(|b| b / boxes.len() as f64).unwrap(),
-					};
-					for (path, bbox) in paths.into_iter().zip(boxes) {
-						let center = match aggregate {
-							AlignAggregate::Min => bbox[0],
-							AlignAggregate::Max => bbox[1],
-							_ => lerp(&bbox),
-						};
-						let translation = (aggregated - center) * axis;
-						responses.push_back(
-							DocumentOperation::TransformLayerInViewport {
-								path: path.to_vec(),
-								transform: DAffine2::from_translation(translation).to_cols_array(),
-							}
-							.into(),
-						);
-					}
-					responses.push_back(BroadcastEvent::DocumentIsDirty.into());
-				}
-			}
-			BooleanOperation(op) => {
-				// Convert Vec<&[LayerId]> to Vec<Vec<&LayerId>> because Vec<&[LayerId]> does not implement several traits (Debug, Serialize, Deserialize, ...) required by DocumentOperation enum
-				responses.push_back(StartTransaction.into());
-				responses.push_back(
-					DocumentOperation::BooleanOperation {
-						operation: op,
-						selected: self.selected_layers_sorted().iter().map(|slice| (*slice).into()).collect(),
-					}
-					.into(),
-				);
-				responses.push_back(CommitTransaction.into());
-			}
-			CommitTransaction => (),
-			CreateEmptyFolder { mut container_path } => {
-				let id = generate_uuid();
-				container_path.push(id);
-				responses.push_back(DocumentMessage::DeselectAllLayers.into());
-				responses.push_back(DocumentOperation::CreateFolder { path: container_path.clone() }.into());
-				responses.push_back(
-					DocumentMessage::SetLayerExpansion {
-						layer_path: container_path,
-						set_expanded: true,
-					}
-					.into(),
-				);
-			}
-			DebugPrintDocument => {
-				let initial_level = log::max_level();
-				log::set_max_level(log::LevelFilter::Trace);
-
-				trace!("{:#?}\n{:#?}", self.graphene_document, self.layer_metadata);
-
-				log::set_max_level(initial_level);
-			}
-			DeleteLayer { layer_path } => {
-				responses.push_front(DocumentOperation::DeleteLayer { path: layer_path.clone() }.into());
-				responses.push_front(BroadcastEvent::ToolAbort.into());
-				responses.push_back(PropertiesPanelMessage::CheckSelectedWasDeleted { path: layer_path }.into());
-			}
-			DeleteSelectedLayers => {
-				self.backup(responses);
-
-				for path in self.selected_layers_without_children() {
-					responses.push_front(DocumentMessage::DeleteLayer { layer_path: path.to_vec() }.into());
-				}
-
-				responses.push_front(BroadcastEvent::SelectionChanged.into());
-				responses.push_back(BroadcastEvent::DocumentIsDirty.into());
-			}
-			DeleteSelectedManipulatorPoints => {
-				responses.push_back(StartTransaction.into());
-
-				responses.push_front(
-					DocumentOperation::DeleteSelectedManipulatorPoints {
-						layer_paths: self.selected_layers_without_children().iter().map(|path| path.to_vec()).collect(),
-					}
-					.into(),
-				);
-			}
-			DeselectAllLayers => {
-				responses.push_front(SetSelectedLayers { replacement_selected_layers: vec![] }.into());
-				self.layer_range_selection_reference.clear();
-			}
-			DeselectAllManipulatorPoints => {
-				for layer_path in self.selected_layers_without_children() {
-					responses.push_back(DocumentOperation::DeselectAllManipulatorPoints { layer_path: layer_path.to_vec() }.into());
-				}
-			}
-			DirtyRenderDocument => {
-				// Mark all non-overlay caches as dirty
-				GrapheneDocument::mark_children_as_dirty(&mut self.graphene_document.root);
-				responses.push_back(DocumentMessage::RenderDocument.into());
-			}
-			DirtyRenderDocumentInOutlineView => {
-				if self.view_mode == ViewMode::Outline {
-					responses.push_front(DocumentMessage::DirtyRenderDocument.into());
-				}
-			}
-			DocumentHistoryBackward => self.undo(responses).unwrap_or_else(|e| warn!("{}", e)),
-			DocumentHistoryForward => self.redo(responses).unwrap_or_else(|e| warn!("{}", e)),
-			DocumentStructureChanged => {
-				let data_buffer: RawBuffer = self.serialize_root().into();
-				responses.push_back(FrontendMessage::UpdateDocumentLayerTreeStructure { data_buffer }.into())
-			}
-			DuplicateSelectedLayers => {
-				self.backup(responses);
-				for path in self.selected_layers_sorted() {
-					responses.push_back(DocumentOperation::DuplicateLayer { path: path.to_vec() }.into());
-				}
-			}
-			ExportDocument {
-				file_name,
-				file_type,
-				scale_factor,
-				bounds,
-			} => {
-				let old_transforms = self.remove_document_transform();
-
-				// Calculate the bounding box of the region to be exported
-				let bounds = match bounds {
-					ExportBounds::AllArtwork => self.all_layer_bounds(&persistent_data.font_cache),
-					ExportBounds::Selection => self.selected_visible_layers_bounding_box(&persistent_data.font_cache),
-					ExportBounds::Artboard(id) => self
-						.artboard_message_handler
-						.artboards_graphene_document
-						.layer(&[id])
-						.ok()
-						.and_then(|layer| layer.aabb(&persistent_data.font_cache)),
-				}
-				.unwrap_or_default();
-				let size = bounds[1] - bounds[0];
-				let transform = (DAffine2::from_translation(bounds[0]) * DAffine2::from_scale(size)).inverse();
-
-				let document = self.render_document(size, transform, persistent_data, DocumentRenderMode::Root);
-				self.restore_document_transform(old_transforms);
-
-				let file_suffix = &format!(".{file_type:?}").to_lowercase();
-				let name = match file_name.ends_with(FILE_SAVE_SUFFIX) {
-					true => file_name.replace(FILE_SAVE_SUFFIX, file_suffix),
-					false => file_name + file_suffix,
+				let Some(combined_box) = self.selected_visible_layers_bounding_box_viewport() else {
+					return;
 				};
 
-				if file_type == FileType::Svg {
-					responses.push_back(FrontendMessage::TriggerFileDownload { document, name }.into());
-				} else {
-					let mime = file_type.to_mime().to_string();
-					let size = (size * scale_factor).into();
-					responses.push_back(FrontendMessage::TriggerRasterDownload { svg: document, name, mime, size }.into());
+				let aggregated = match aggregate {
+					AlignAggregate::Min => combined_box[0],
+					AlignAggregate::Max => combined_box[1],
+					AlignAggregate::Center => (combined_box[0] + combined_box[1]) / 2.,
+				};
+				for layer in self.selected_nodes.selected_unlocked_layers(self.metadata()) {
+					let Some(bbox) = self.metadata().bounding_box_viewport(layer) else {
+						continue;
+					};
+					let center = match aggregate {
+						AlignAggregate::Min => bbox[0],
+						AlignAggregate::Max => bbox[1],
+						_ => (bbox[0] + bbox[1]) / 2.,
+					};
+					let translation = (aggregated - center) * axis;
+					responses.add(GraphOperationMessage::TransformChange {
+						layer,
+						transform: DAffine2::from_translation(translation),
+						transform_in: TransformIn::Viewport,
+						skip_rerender: false,
+					});
 				}
 			}
-			FlipSelectedLayers { flip_axis } => {
+			DocumentMessage::BackupDocument { network } => self.backup_with_document(network, responses),
+			DocumentMessage::ClearArtboards => {
+				self.backup(responses);
+				responses.add(GraphOperationMessage::ClearArtboards);
+			}
+			DocumentMessage::ClearLayersPanel => {
+				// Send an empty layer list
+				let data_buffer: RawBuffer = Self::default().serialize_root();
+				responses.add(FrontendMessage::UpdateDocumentLayerStructure { data_buffer });
+
+				// Clear the options bar
+				responses.add(LayoutMessage::SendLayout {
+					layout: Layout::WidgetLayout(Default::default()),
+					layout_target: LayoutTarget::LayersPanelOptions,
+				});
+			}
+			DocumentMessage::CommitTransaction => (),
+			DocumentMessage::CreateEmptyFolder => {
+				let id = NodeId(generate_uuid());
+
+				let parent = self
+					.metadata()
+					.deepest_common_ancestor(self.selected_nodes.selected_layers(self.metadata()), true)
+					.unwrap_or(LayerNodeIdentifier::ROOT_PARENT);
+
+				let insert_index = parent
+					.children(self.metadata())
+					.enumerate()
+					.find_map(|(index, item)| self.selected_nodes.selected_layers(self.metadata()).any(|x| x == item).then_some(index as isize))
+					.unwrap_or(-1);
+
+				responses.add(DocumentMessage::StartTransaction);
+				responses.add(GraphOperationMessage::NewCustomLayer {
+					id,
+					nodes: HashMap::new(),
+					parent,
+					insert_index,
+					alias: String::new(),
+				});
+				responses.add(NodeGraphMessage::SelectedNodesSet { nodes: vec![id] });
+			}
+			DocumentMessage::DebugPrintDocument => {
+				info!("{:#?}", self.network);
+			}
+			DocumentMessage::DeleteLayer { layer } => {
+				responses.add(GraphOperationMessage::DeleteLayer { layer, reconnect: true });
+				responses.add_front(BroadcastEvent::ToolAbort);
+			}
+			DocumentMessage::DeleteSelectedLayers => {
+				self.backup(responses);
+
+				responses.add_front(BroadcastEvent::SelectionChanged);
+				for path in self.metadata().shallowest_unique_layers(self.selected_nodes.selected_layers(self.metadata())) {
+					// `path` will never include `ROOT_PARENT`, so this is safe
+					responses.add_front(DocumentMessage::DeleteLayer { layer: *path.last().unwrap() });
+				}
+			}
+			DocumentMessage::DeselectAllLayers => {
+				responses.add(NodeGraphMessage::SelectedNodesSet { nodes: vec![] });
+				self.layer_range_selection_reference = None;
+			}
+			DocumentMessage::DocumentHistoryBackward => self.undo_with_history(responses),
+			DocumentMessage::DocumentHistoryForward => self.redo_with_history(responses),
+			DocumentMessage::DocumentStructureChanged => {
+				self.update_layers_panel_options_bar_widgets(responses);
+
+				self.metadata.load_structure(&self.network);
+				let data_buffer: RawBuffer = self.serialize_root();
+				responses.add(FrontendMessage::UpdateDocumentLayerStructure { data_buffer });
+			}
+			DocumentMessage::DuplicateSelectedLayers => {
+				let parent = self.new_layer_parent(false);
+				let calculated_insert_index = DocumentMessageHandler::get_calculated_insert_index(&self.metadata, &self.selected_nodes, parent);
+
+				responses.add(DocumentMessage::StartTransaction);
+				responses.add(PortfolioMessage::Copy { clipboard: Clipboard::Internal });
+				responses.add(PortfolioMessage::PasteIntoFolder {
+					clipboard: Clipboard::Internal,
+					parent,
+					insert_index: calculated_insert_index,
+				});
+			}
+			DocumentMessage::FlipSelectedLayers { flip_axis } => {
 				self.backup(responses);
 				let scale = match flip_axis {
 					FlipAxis::X => DVec2::new(-1., 1.),
 					FlipAxis::Y => DVec2::new(1., -1.),
 				};
-				if let Some([min, max]) = self.graphene_document.combined_viewport_bounding_box(self.selected_layers(), &persistent_data.font_cache) {
+				if let Some([min, max]) = self.selected_visible_and_unlock_layers_bounding_box_viewport() {
 					let center = (max + min) / 2.;
 					let bbox_trans = DAffine2::from_translation(-center);
-					for path in self.selected_layers() {
-						responses.push_back(
-							DocumentOperation::TransformLayerInScope {
-								path: path.to_vec(),
-								transform: DAffine2::from_scale(scale).to_cols_array(),
-								scope: bbox_trans.to_cols_array(),
-							}
-							.into(),
-						);
+					for layer in self.selected_nodes.selected_unlocked_layers(self.metadata()) {
+						responses.add(GraphOperationMessage::TransformChange {
+							layer,
+							transform: DAffine2::from_scale(scale),
+							transform_in: TransformIn::Scope { scope: bbox_trans },
+							skip_rerender: false,
+						});
 					}
-					responses.push_back(BroadcastEvent::DocumentIsDirty.into());
 				}
 			}
-			FolderChanged { affected_folder_path } => {
-				let affected_layer_path = affected_folder_path;
-				responses.extend([LayerChanged { affected_layer_path }.into(), DocumentStructureChanged.into()]);
-			}
-			FrameClear => {
-				let mut selected_frame_layers = self
-					.selected_layers_with_type(LayerDataTypeDiscriminant::Imaginate)
-					.chain(self.selected_layers_with_type(LayerDataTypeDiscriminant::NodeGraphFrame));
-				// Get what is hopefully the only selected Imaginate/NodeGraphFrame layer
-				let layer_path = selected_frame_layers.next();
-				// Abort if we didn't have any Imaginate/NodeGraphFrame layer, or if there are additional ones also selected
-				if layer_path.is_none() || selected_frame_layers.next().is_some() {
-					return;
-				}
-				let layer_path = layer_path.unwrap();
+			DocumentMessage::GraphViewOverlay { open } => {
+				self.graph_view_overlay_open = open;
 
-				let layer = self.graphene_document.layer(layer_path).expect("Clearing Imaginate/NodeGraphFrame image for invalid layer");
-				let previous_blob_url = match &layer.data {
-					LayerDataType::Imaginate(imaginate) => &imaginate.blob_url,
-					LayerDataType::NodeGraphFrame(node_graph_frame) => &node_graph_frame.blob_url,
-					x => panic!("Cannot find blob url for layer type {}", LayerDataTypeDiscriminant::from(x)),
+				// TODO: Find a better way to update click targets when undoing/redoing
+				if self.graph_view_overlay_open {
+					self.node_graph_handler.update_all_click_targets(&mut self.network, self.node_graph_handler.network.clone())
+				}
+
+				responses.add(FrontendMessage::TriggerGraphViewOverlay { open });
+				responses.add(FrontendMessage::TriggerRefreshBoundsOfViewports);
+				// Update the tilt menu bar buttons to be disabled when the graph is open
+				responses.add(MenuBarMessage::SendLayout);
+				if open {
+					responses.add(NodeGraphMessage::SendGraph);
+					responses.add(NavigationMessage::CanvasTiltSet { angle_radians: 0. });
+				}
+			}
+			DocumentMessage::GraphViewOverlayToggle => {
+				responses.add(DocumentMessage::GraphViewOverlay { open: !self.graph_view_overlay_open });
+			}
+			DocumentMessage::GridOptions(grid) => {
+				self.snapping_state.grid = grid;
+				self.snapping_state.grid_snapping = true;
+				responses.add(OverlaysMessage::Draw);
+				responses.add(PortfolioMessage::UpdateDocumentWidgets);
+			}
+			DocumentMessage::GridOverlays(mut overlay_context) => {
+				if self.snapping_state.grid_snapping {
+					grid_overlay(self, &mut overlay_context)
+				}
+			}
+			DocumentMessage::GridVisibility(enabled) => {
+				self.snapping_state.grid_snapping = enabled;
+				responses.add(OverlaysMessage::Draw);
+			}
+			DocumentMessage::GroupSelectedLayers => {
+				responses.add(DocumentMessage::StartTransaction);
+
+				let Some(parent) = self.metadata().deepest_common_ancestor(self.selected_nodes.selected_layers(self.metadata()), false) else {
+					// Cancel grouping layers across different artboards
+					// TODO: Group each set of layers for each artboard separately
+					return;
 				};
 
-				if let Some(url) = previous_blob_url {
-					responses.push_back(FrontendMessage::TriggerRevokeBlobUrl { url: url.clone() }.into());
-				}
-				responses.push_back(DocumentOperation::ClearBlobURL { path: layer_path.into() }.into());
-			}
-			GroupSelectedLayers => {
-				let mut new_folder_path = self.graphene_document.shallowest_common_folder(self.selected_layers()).unwrap_or(&[]).to_vec();
+				// Move layers in nested unselected folders above the first unselected parent folder
+				let selected_layers = self.selected_nodes.selected_layers(self.metadata()).collect::<Vec<_>>();
+				for layer in selected_layers.clone() {
+					let mut first_unselected_parent_folder = layer.parent(&self.metadata).expect("Layer should always have parent");
 
-				// Required for grouping parent folders with their own children
-				if !new_folder_path.is_empty() && self.selected_layers_contains(&new_folder_path) {
-					new_folder_path.remove(new_folder_path.len() - 1);
-				}
-
-				new_folder_path.push(generate_uuid());
-
-				responses.push_back(PortfolioMessage::Copy { clipboard: Clipboard::Internal }.into());
-				responses.push_back(DocumentMessage::DeleteSelectedLayers.into());
-				responses.push_back(DocumentOperation::CreateFolder { path: new_folder_path.clone() }.into());
-				responses.push_back(DocumentMessage::ToggleLayerExpansion { layer_path: new_folder_path.clone() }.into());
-				responses.push_back(
-					PortfolioMessage::PasteIntoFolder {
-						clipboard: Clipboard::Internal,
-						folder_path: new_folder_path.clone(),
-						insert_index: -1,
-					}
-					.into(),
-				);
-				responses.push_back(
-					DocumentMessage::SetSelectedLayers {
-						replacement_selected_layers: vec![new_folder_path],
-					}
-					.into(),
-				);
-			}
-			ImaginateGenerate => {
-				if let Some(message) = self.call_imaginate(document_id, preferences, persistent_data) {
-					// TODO: Eventually remove this after a message system ordering architectural change
-					// This message is a workaround for the fact that, when `imaginate.ts` calls...
-					// `editor.instance.setImaginateGeneratingStatus(layerPath, 0, true);`
-					// ...execution transfers from the Rust part of the call stack into the JS part of the call stack (before the Rust message queue is empty,
-					// and there is a Properties panel refresh queued next). Then the JS calls that line shown above and enters the Rust part of the callstack
-					// again, so it's gone through JS (user initiation) -> Rust (process the button press) -> JS (beginning server request) -> Rust (set
-					// progress percentage to 0). As that call stack returns back from the Rust and back from the JS, it returns to the Rust and finishes
-					// processing the queue. That's where it then processes the Properties panel refresh that sent the "Ready" or "Done" state that existed
-					// before pressing the Generate button causing it to show "0%". So "Ready" or "Done" immediately overwrites the "0%". This block below,
-					// therefore, adds a redundant call to set it to 0% progress so the message execution order ends with this as the final percentage shown
-					// to the user.
-					responses.push_back(
-						DocumentOperation::ImaginateSetGeneratingStatus {
-							path: self.selected_layers_with_type(LayerDataTypeDiscriminant::Imaginate).next().unwrap().to_vec(),
-							percent: Some(0.),
-							status: ImaginateStatus::Beginning,
+					// Find folder in parent child stack
+					loop {
+						// Loop until parent layer is deselected. Note that parent cannot be selected, since it is an ancestor of all selected layers
+						if !selected_layers.iter().any(|selected_layer| *selected_layer == first_unselected_parent_folder) {
+							break;
 						}
-						.into(),
-					);
-
-					responses.push_back(message);
-				}
-			}
-			ImaginateTerminate => {
-				let hostname = preferences.imaginate_server_hostname.clone();
-
-				let layer_path = {
-					let mut selected_imaginate_layers = self.selected_layers_with_type(LayerDataTypeDiscriminant::Imaginate);
-
-					// Get what is hopefully the only selected Imaginate layer
-					match selected_imaginate_layers.next() {
-						// Continue only if there are no additional Imaginate layers also selected
-						Some(layer_path) if selected_imaginate_layers.next().is_none() => Some(layer_path.to_owned()),
-						_ => None,
+						let Some(new_folder) = first_unselected_parent_folder.parent(&self.metadata) else {
+							log::error!("Layer should always have parent");
+							return;
+						};
+						first_unselected_parent_folder = new_folder;
 					}
-				};
 
-				if let Some(layer_path) = layer_path {
-					responses.push_back(FrontendMessage::TriggerImaginateTerminate { document_id, layer_path, hostname }.into());
+					// Don't move nodes above new group folder parent
+					if first_unselected_parent_folder == parent {
+						continue;
+					}
+
+					// `ROOT_PARENT` cannot be selected, so this should never be true
+					if layer == LayerNodeIdentifier::ROOT_PARENT {
+						log::error!("ROOT_PARENT cannot be deleted");
+						continue;
+					}
+
+					// `first_unselected_parent_folder` must be a child of `parent`, so it cannot be the `ROOT_PARENT`
+					if first_unselected_parent_folder == LayerNodeIdentifier::ROOT_PARENT {
+						log::error!("first_unselected_parent_folder cannot be ROOT_PARENT");
+						continue;
+					}
+
+					responses.add(GraphOperationMessage::DisconnectNodeFromStack {
+						node_id: layer.to_node(),
+						reconnect_to_sibling: true,
+					});
+
+					// Move disconnected node to folder
+					let folder_position = self
+						.network
+						.nodes
+						.get(&first_unselected_parent_folder.to_node())
+						.expect("Current folder should always exist")
+						.metadata
+						.position;
+
+					responses.add(GraphOperationMessage::SetNodePosition {
+						node_id: layer.to_node(),
+						position: folder_position,
+					});
+
+					// Insert node right above the folder
+					// TODO: downstream node can be none if it is the root node
+					let (folder_downstream_node_id, folder_downstream_input_index) =
+						DocumentMessageHandler::get_downstream_node(&self.network, &self.metadata, first_unselected_parent_folder).unwrap_or((self.network.exports_metadata.0, 0));
+
+					responses.add(GraphOperationMessage::InsertNodeBetween {
+						post_node_id: folder_downstream_node_id,
+						post_node_input_index: folder_downstream_input_index,
+						insert_node_output_index: 0,
+						insert_node_id: layer.to_node(),
+						insert_node_input_index: 0,
+						pre_node_output_index: 0,
+						pre_node_id: first_unselected_parent_folder.to_node(),
+					});
+
+					responses.add(GraphOperationMessage::ShiftUpstream {
+						node_id: first_unselected_parent_folder.to_node(),
+						shift: IVec2::new(0, 3),
+						shift_self: true,
+					});
+				}
+				let calculated_insert_index = DocumentMessageHandler::get_calculated_insert_index(&self.metadata, &self.selected_nodes, parent);
+
+				let folder_id = NodeId(generate_uuid());
+				responses.add(GraphOperationMessage::NewCustomLayer {
+					id: folder_id,
+					nodes: HashMap::new(),
+					parent,
+					insert_index: calculated_insert_index,
+					alias: String::new(),
+				});
+
+				let parent = LayerNodeIdentifier::new_unchecked(folder_id);
+				responses.add(GraphOperationMessage::MoveSelectedSiblingsToChild { new_parent: parent });
+
+				responses.add(NodeGraphMessage::SelectedNodesSet { nodes: vec![folder_id] });
+				responses.add(NodeGraphMessage::RunDocumentGraph);
+				responses.add(DocumentMessage::DocumentStructureChanged);
+				responses.add(NodeGraphMessage::SendGraph);
+			}
+			DocumentMessage::ImaginateGenerate => responses.add(PortfolioMessage::SubmitGraphRender { document_id }),
+			DocumentMessage::ImaginateRandom { imaginate_node, then_generate } => {
+				// Generate a random seed. We only want values between -2^53 and 2^53, because integer values
+				// outside of this range can get rounded in f64
+				let random_bits = generate_uuid();
+				let random_value = ((random_bits >> 11) as f64).copysign(f64::from_bits(random_bits & (1 << 63)));
+
+				responses.add(DocumentMessage::StartTransaction);
+				// Set a random seed input
+				responses.add(NodeGraphMessage::SetInputValue {
+					node_id: *imaginate_node.last().unwrap(),
+					// Needs to match the index of the seed parameter in `pub const IMAGINATE_NODE: DocumentNodeDefinition` in `document_node_type.rs`
+					input_index: 3,
+					value: graph_craft::document::value::TaggedValue::F64(random_value),
+				});
+
+				// Generate the image
+				if then_generate {
+					responses.add(DocumentMessage::ImaginateGenerate);
 				}
 			}
-			LayerChanged { affected_layer_path } => {
-				if let Ok(layer_entry) = self.layer_panel_entry(affected_layer_path.clone(), &persistent_data.font_cache) {
-					responses.push_back(FrontendMessage::UpdateDocumentLayerDetails { data: layer_entry }.into());
-				}
-				responses.push_back(PropertiesPanelMessage::CheckSelectedWasUpdated { path: affected_layer_path }.into());
-				self.update_layer_tree_options_bar_widgets(responses, &persistent_data.font_cache);
-			}
-			MoveSelectedLayersTo {
-				folder_path,
+			DocumentMessage::ImportSvg {
+				id,
+				svg,
+				transform,
+				parent,
 				insert_index,
-				reverse_index,
 			} => {
-				let selected_layers = self.selected_layers().collect::<Vec<_>>();
+				self.backup(responses);
+				responses.add(GraphOperationMessage::NewSvg {
+					id,
+					svg,
+					transform,
+					parent,
+					insert_index,
+				});
+			}
+			DocumentMessage::MoveSelectedLayersTo { parent, insert_index } => {
+				responses.add(DocumentMessage::StartTransaction);
 
-				// Prevent trying to insert into self
-				if selected_layers.iter().any(|layer| folder_path.starts_with(layer)) {
+				let selected_layers = self.selected_nodes.selected_layers(self.metadata()).collect::<Vec<_>>();
+				// Disallow trying to insert into self.
+				if selected_layers.iter().any(|&layer| parent.ancestors(self.metadata()).any(|ancestor| ancestor == layer)) {
+					return;
+				}
+				// Artboards can only have `ROOT_PARENT` as the parent.
+				let any_artboards = selected_layers.iter().any(|&layer| self.metadata.is_artboard(layer));
+				if any_artboards && parent != LayerNodeIdentifier::ROOT_PARENT {
 					return;
 				}
 
-				let insert_index = self.update_insert_index(&selected_layers, &folder_path, insert_index, reverse_index).unwrap();
+				// Non-artboards cannot be put at the top level if artboards also exist there
+				let selected_any_non_artboards = selected_layers.iter().any(|&layer| !self.metadata.is_artboard(layer));
+				let top_level_artboards = LayerNodeIdentifier::ROOT_PARENT.children(self.metadata()).any(|layer| self.metadata.is_artboard(layer));
+				if selected_any_non_artboards && parent == LayerNodeIdentifier::ROOT_PARENT && top_level_artboards {
+					return;
+				}
+				let mut insert_index = if insert_index < 0 { 0 } else { insert_index as usize };
 
-				responses.push_back(PortfolioMessage::Copy { clipboard: Clipboard::Internal }.into());
-				responses.push_back(DocumentMessage::DeleteSelectedLayers.into());
-				responses.push_back(
-					PortfolioMessage::PasteIntoFolder {
-						clipboard: Clipboard::Internal,
-						folder_path,
+				let layer_above_insertion = if insert_index == 0 { Some(parent) } else { parent.children(&self.metadata).nth(insert_index - 1) };
+
+				let binding = self.metadata.shallowest_unique_layers(self.selected_nodes.selected_layers(&self.metadata));
+				let get_last_elements = binding.iter().map(|x| x.last().expect("empty path")).collect::<Vec<_>>();
+
+				// TODO: The `.collect()` is necessary to avoid borrowing issues with `self`. See if this can be avoided to improve performance.
+				let ordered_last_elements = self.metadata.all_layers().filter(|layer| get_last_elements.contains(&layer)).rev().collect::<Vec<_>>();
+				for layer_to_move in ordered_last_elements {
+					if insert_index > 0
+						&& layer_to_move
+							.upstream_siblings(&self.metadata)
+							.any(|layer| layer_above_insertion.is_some_and(|layer_above_insertion| layer_above_insertion == layer))
+					{
+						insert_index -= 1;
+					}
+
+					// `layer_to_move` should never be `ROOT_PARENT`, since it is not included in `all_layers()`
+					if layer_to_move == LayerNodeIdentifier::ROOT_PARENT {
+						log::error!("Layer to move cannot be root parent");
+						continue;
+					}
+
+					// Disconnect layer to move and reconnect downstream node to upstream sibling if it exists.
+					responses.add(GraphOperationMessage::DisconnectNodeFromStack {
+						node_id: layer_to_move.to_node(),
+						reconnect_to_sibling: true,
+					});
+					// Reconnect layer_to_move to new parent at insert index.
+					responses.add(GraphOperationMessage::InsertNodeAtStackIndex {
+						node_id: layer_to_move.to_node(),
+						parent: parent,
 						insert_index,
-					}
-					.into(),
-				);
-			}
-			MoveSelectedManipulatorPoints { layer_path, delta } => {
-				if let Ok(_layer) = self.graphene_document.layer(&layer_path) {
-					responses.push_back(DocumentOperation::MoveSelectedManipulatorPoints { layer_path, delta }.into());
+					});
 				}
+
+				responses.add(NodeGraphMessage::RunDocumentGraph);
+				responses.add(NodeGraphMessage::SendGraph);
 			}
-			NodeGraphFrameGenerate => {
-				if let Some(message) = self.call_node_graph_frame(document_id, preferences, persistent_data) {
-					responses.push_back(message);
-				}
-			}
-			NudgeSelectedLayers { delta_x, delta_y } => {
+			DocumentMessage::NudgeSelectedLayers {
+				delta_x,
+				delta_y,
+				resize,
+				resize_opposite_corner,
+			} => {
 				self.backup(responses);
-				for path in self.selected_layers().map(|path| path.to_vec()) {
-					let operation = DocumentOperation::TransformLayerInViewport {
-						path,
-						transform: DAffine2::from_translation((delta_x, delta_y).into()).to_cols_array(),
-					};
-					responses.push_back(operation.into());
+
+				let opposite_corner = ipp.keyboard.key(resize_opposite_corner);
+				let delta = DVec2::new(delta_x, delta_y);
+
+				match ipp.keyboard.key(resize) {
+					// Nudge translation
+					false => {
+						for layer in self
+							.selected_nodes
+							.selected_layers(self.metadata())
+							.filter(|&layer| self.selected_nodes.layer_visible(layer, self.metadata()) && !self.selected_nodes.layer_locked(layer, self.metadata()))
+						{
+							responses.add(GraphOperationMessage::TransformChange {
+								layer,
+								transform: DAffine2::from_translation(delta),
+								transform_in: TransformIn::Local,
+								skip_rerender: false,
+							});
+						}
+					}
+					// Nudge resize
+					true => {
+						let selected_bounding_box = self.metadata().selected_bounds_document_space(false, &self.selected_nodes);
+						let Some([existing_top_left, existing_bottom_right]) = selected_bounding_box else { return };
+
+						let size = existing_bottom_right - existing_top_left;
+						let new_size = size + if opposite_corner { -delta } else { delta };
+						let enlargement_factor = new_size / size;
+
+						let position = existing_top_left + if opposite_corner { delta } else { DVec2::ZERO };
+						let mut pivot = (existing_top_left * enlargement_factor - position) / (enlargement_factor - DVec2::splat(1.));
+						if !pivot.x.is_finite() {
+							pivot.x = 0.;
+						}
+						if !pivot.y.is_finite() {
+							pivot.y = 0.;
+						}
+
+						let scale = DAffine2::from_scale(enlargement_factor);
+						let pivot = DAffine2::from_translation(pivot);
+						let transformation = pivot * scale * pivot.inverse();
+
+						for layer in self
+							.selected_nodes
+							.selected_layers(self.metadata())
+							.filter(|&layer| self.selected_nodes.layer_visible(layer, self.metadata()) && !self.selected_nodes.layer_locked(layer, self.metadata()))
+						{
+							let to = self.metadata().document_to_viewport.inverse() * self.metadata().downstream_transform_to_viewport(layer);
+							let original_transform = self.metadata().upstream_transform(layer.to_node());
+							let new = to.inverse() * transformation * to * original_transform;
+							responses.add(GraphOperationMessage::TransformSet {
+								layer,
+								transform: new,
+								transform_in: TransformIn::Local,
+								skip_rerender: false,
+							});
+						}
+					}
 				}
-				responses.push_back(BroadcastEvent::DocumentIsDirty.into());
 			}
-			PasteImage { mime, image_data, mouse } => {
-				let path = vec![generate_uuid()];
-				responses.push_back(
-					DocumentOperation::AddImage {
-						path: path.clone(),
-						transform: DAffine2::ZERO.to_cols_array(),
-						insert_index: -1,
-						image_data: image_data.clone(),
-						mime: mime.clone(),
-					}
-					.into(),
-				);
-				let image_data = std::rc::Rc::new(image_data);
-				responses.push_back(
-					FrontendMessage::UpdateImageData {
-						document_id,
-						image_data: vec![FrontendImageData { path: path.clone(), image_data, mime }],
-					}
-					.into(),
-				);
-				responses.push_back(
-					DocumentMessage::SetSelectedLayers {
-						replacement_selected_layers: vec![path.clone()],
-					}
-					.into(),
-				);
+			DocumentMessage::PasteImage { image, mouse } => {
+				// All the image's pixels have been converted to 0..=1, linear, and premultiplied by `Color::from_rgba8_srgb`
 
-				let mouse = mouse.map_or(ipp.viewport_bounds.center(), |pos| pos.into());
-				let transform = DAffine2::from_translation(mouse - ipp.viewport_bounds.top_left).to_cols_array();
-				responses.push_back(DocumentOperation::SetLayerTransformInViewport { path, transform }.into());
-			}
-			Redo => {
-				responses.push_back(SelectToolMessage::Abort.into());
-				responses.push_back(DocumentHistoryForward.into());
-				responses.push_back(BroadcastEvent::DocumentIsDirty.into());
-				responses.push_back(RenderDocument.into());
-				responses.push_back(FolderChanged { affected_folder_path: vec![] }.into());
-			}
-			RenameLayer { layer_path, new_name } => responses.push_back(DocumentOperation::RenameLayer { layer_path, new_name }.into()),
-			RenderDocument => {
-				let render_data = RenderData::new(self.view_mode, &persistent_data.font_cache, Some(ipp.document_bounds()));
-				responses.push_back(
-					FrontendMessage::UpdateDocumentArtwork {
-						svg: self.graphene_document.render_root(render_data),
-					}
-					.into(),
-				);
-				responses.push_back(ArtboardMessage::RenderArtboards.into());
+				let image_size = DVec2::new(image.width as f64, image.height as f64);
 
-				let document_transform_scale = self.navigation_handler.snapped_scale();
+				// Align the layer with the mouse or center of viewport
+				let viewport_location = mouse.map_or(ipp.viewport_bounds.center() + ipp.viewport_bounds.top_left, |pos| pos.into());
+				let center_in_viewport = DAffine2::from_translation(self.metadata().document_to_viewport.inverse().transform_point2(viewport_location - ipp.viewport_bounds.top_left));
+				let center_in_viewport_layerspace = center_in_viewport;
+
+				// Scale the image to fit into a 512x512 box
+				let image_size = image_size / DVec2::splat((image_size.max_element() / 512.).max(1.));
+
+				// Make layer the size of the image
+				let fit_image_size = DAffine2::from_scale_angle_translation(image_size, 0., image_size / -2.);
+
+				let transform = center_in_viewport_layerspace * fit_image_size;
+
+				responses.add(DocumentMessage::StartTransaction);
+
+				let image_frame = ImageFrame { image, ..Default::default() };
+
+				use crate::messages::tool::common_functionality::graph_modification_utils;
+				let layer = graph_modification_utils::new_image_layer(image_frame, NodeId(generate_uuid()), self.new_layer_parent(true), responses);
+
+				// `layer` cannot be `ROOT_PARENT` since it is the newly created layer
+				responses.add(NodeGraphMessage::SelectedNodesSet { nodes: vec![layer.to_node()] });
+
+				responses.add(GraphOperationMessage::TransformSet {
+					layer,
+					transform,
+					transform_in: TransformIn::Local,
+					skip_rerender: false,
+				});
+
+				// Force chosen tool to be Select Tool after importing image.
+				responses.add(ToolMessage::ActivateTool { tool_type: ToolType::Select });
+			}
+			DocumentMessage::PasteSvg { svg, mouse } => {
+				use crate::messages::tool::common_functionality::graph_modification_utils;
+				let viewport_location = mouse.map_or(ipp.viewport_bounds.center() + ipp.viewport_bounds.top_left, |pos| pos.into());
+				let center_in_viewport = DAffine2::from_translation(self.metadata().document_to_viewport.inverse().transform_point2(viewport_location - ipp.viewport_bounds.top_left));
+				let layer = graph_modification_utils::new_svg_layer(svg, center_in_viewport, NodeId(generate_uuid()), self.new_layer_parent(true), responses);
+				responses.add(NodeGraphMessage::SelectedNodesSet { nodes: vec![layer.to_node()] });
+				responses.add(ToolMessage::ActivateTool { tool_type: ToolType::Select });
+			}
+			DocumentMessage::Redo => {
+				responses.add(SelectToolMessage::Abort);
+				responses.add(DocumentMessage::DocumentHistoryForward);
+				responses.add(ToolMessage::Redo);
+				responses.add(OverlaysMessage::Draw);
+			}
+			DocumentMessage::RenameDocument { new_name } => {
+				self.name = new_name;
+				responses.add(PortfolioMessage::UpdateOpenDocumentsList);
+				responses.add(NodeGraphMessage::UpdateNewNodeGraph);
+			}
+			DocumentMessage::RenderRulers => {
+				let document_transform_scale = self.navigation_handler.snapped_zoom(self.navigation.zoom);
+
+				let ruler_origin = if !self.graph_view_overlay_open {
+					self.metadata().document_to_viewport.transform_point2(DVec2::ZERO)
+				} else {
+					let Some(network) = self.network.nested_network(&self.node_graph_handler.network) else {
+						log::error!("Nested network not found in UpdateDocumentTransform");
+						return;
+					};
+					network.node_graph_to_viewport.transform_point2(DVec2::ZERO)
+				};
+				let log = document_transform_scale.log2();
+				let ruler_interval: f64 = if log < 0. { 100. * 2_f64.powf(-log.ceil()) } else { 100. / 2_f64.powf(log.ceil()) };
+				let ruler_spacing = ruler_interval * document_transform_scale;
+
+				responses.add(FrontendMessage::UpdateDocumentRulers {
+					origin: ruler_origin.into(),
+					spacing: ruler_spacing,
+					interval: ruler_interval,
+					visible: self.rulers_visible,
+				});
+			}
+			DocumentMessage::RenderScrollbars => {
+				let document_transform_scale = self.navigation_handler.snapped_zoom(self.navigation.zoom);
+
 				let scale = 0.5 + ASYMPTOTIC_EFFECT + document_transform_scale * SCALE_EFFECT;
+
 				let viewport_size = ipp.viewport_bounds.size();
 				let viewport_mid = ipp.viewport_bounds.center();
-				let [bounds1, bounds2] = self.document_bounds(&persistent_data.font_cache).unwrap_or([viewport_mid; 2]);
+				let [bounds1, bounds2] = if !self.graph_view_overlay_open {
+					self.metadata().document_bounds_viewport_space().unwrap_or([viewport_mid; 2])
+				} else {
+					self.node_graph_handler.graph_bounds_viewport_space(&self.network).unwrap_or([viewport_mid; 2])
+				};
 				let bounds1 = bounds1.min(viewport_mid) - viewport_size * scale;
 				let bounds2 = bounds2.max(viewport_mid) + viewport_size * scale;
 				let bounds_length = (bounds2 - bounds1) * (1. + SCROLLBAR_SPACING);
@@ -597,507 +776,532 @@ impl MessageHandler<DocumentMessage, (u64, &InputPreprocessorMessageHandler, &Pe
 				let scrollbar_multiplier = bounds_length - viewport_size;
 				let scrollbar_size = viewport_size / bounds_length;
 
-				let log = document_transform_scale.log2();
-				let ruler_interval = if log < 0. { 100. * 2_f64.powf(-log.ceil()) } else { 100. / 2_f64.powf(log.ceil()) };
-				let ruler_spacing = ruler_interval * document_transform_scale;
-
-				let ruler_origin = self.graphene_document.root.transform.transform_point2(DVec2::ZERO);
-
-				responses.push_back(
-					FrontendMessage::UpdateDocumentScrollbars {
-						position: scrollbar_position.into(),
-						size: scrollbar_size.into(),
-						multiplier: scrollbar_multiplier.into(),
-					}
-					.into(),
-				);
-
-				responses.push_back(
-					FrontendMessage::UpdateDocumentRulers {
-						origin: ruler_origin.into(),
-						spacing: ruler_spacing,
-						interval: ruler_interval,
-					}
-					.into(),
-				);
+				responses.add(FrontendMessage::UpdateDocumentScrollbars {
+					position: scrollbar_position.into(),
+					size: scrollbar_size.into(),
+					multiplier: scrollbar_multiplier.into(),
+				});
 			}
-			RollbackTransaction => {
-				self.rollback(responses).unwrap_or_else(|e| warn!("{}", e));
-				responses.extend([RenderDocument.into(), DocumentStructureChanged.into()]);
-			}
-			SaveDocument => {
+			DocumentMessage::SaveDocument => {
 				self.set_save_state(true);
-				responses.push_back(PortfolioMessage::AutoSaveActiveDocument.into());
+				responses.add(PortfolioMessage::AutoSaveActiveDocument);
 				// Update the save status of the just saved document
-				responses.push_back(PortfolioMessage::UpdateOpenDocumentsList.into());
+				responses.add(PortfolioMessage::UpdateOpenDocumentsList);
 
 				let name = match self.name.ends_with(FILE_SAVE_SUFFIX) {
 					true => self.name.clone(),
 					false => self.name.clone() + FILE_SAVE_SUFFIX,
 				};
-				responses.push_back(
-					FrontendMessage::TriggerFileDownload {
-						document: self.serialize_document(),
-						name,
-					}
-					.into(),
-				)
+				responses.add(FrontendMessage::TriggerDownloadTextFile {
+					document: self.serialize_document(),
+					name,
+				})
 			}
-			SelectAllLayers => {
-				let all = self.all_layers().map(|path| path.to_vec()).collect();
-				responses.push_front(SetSelectedLayers { replacement_selected_layers: all }.into());
+			DocumentMessage::SelectAllLayers => {
+				let metadata = self.metadata();
+				let all_layers_except_artboards_invisible_and_locked = metadata
+					.all_layers()
+					.filter(move |&layer| !metadata.is_artboard(layer))
+					.filter(|&layer| self.selected_nodes.layer_visible(layer, metadata) && !self.selected_nodes.layer_locked(layer, metadata));
+				let nodes = all_layers_except_artboards_invisible_and_locked.map(|layer| layer.to_node()).collect();
+				responses.add(NodeGraphMessage::SelectedNodesSet { nodes });
 			}
-			SelectedLayersLower => {
-				responses.push_front(DocumentMessage::SelectedLayersReorder { relative_index_offset: -1 }.into());
+			DocumentMessage::SelectedLayersLower => {
+				responses.add(DocumentMessage::SelectedLayersReorder { relative_index_offset: 1 });
 			}
-			SelectedLayersLowerToBack => {
-				responses.push_front(DocumentMessage::SelectedLayersReorder { relative_index_offset: isize::MIN }.into());
+			DocumentMessage::SelectedLayersLowerToBack => {
+				responses.add(DocumentMessage::SelectedLayersReorder { relative_index_offset: isize::MAX });
 			}
-			SelectedLayersRaise => {
-				responses.push_front(DocumentMessage::SelectedLayersReorder { relative_index_offset: 1 }.into());
+			DocumentMessage::SelectedLayersRaise => {
+				responses.add(DocumentMessage::SelectedLayersReorder { relative_index_offset: -1 });
 			}
-			SelectedLayersRaiseToFront => {
-				responses.push_front(DocumentMessage::SelectedLayersReorder { relative_index_offset: isize::MAX }.into());
+			DocumentMessage::SelectedLayersRaiseToFront => {
+				responses.add(DocumentMessage::SelectedLayersReorder { relative_index_offset: isize::MIN });
 			}
-			SelectedLayersReorder { relative_index_offset } => {
+			DocumentMessage::SelectedLayersReorder { relative_index_offset } => {
 				self.selected_layers_reorder(relative_index_offset, responses);
 			}
-			SelectLayer { layer_path, ctrl, shift } => {
-				let mut paths = vec![];
-				let last_selection_exists = !self.layer_range_selection_reference.is_empty();
+			DocumentMessage::SelectLayer { id, ctrl, shift } => {
+				let layer = LayerNodeIdentifier::new(id, self.network());
+
+				let mut nodes = vec![];
 
 				// If we have shift pressed and a layer already selected then fill the range
-				if shift && last_selection_exists {
+				if let Some(last_selected) = self.layer_range_selection_reference.filter(|_| shift) {
+					if last_selected == LayerNodeIdentifier::ROOT_PARENT {
+						log::error!("ROOT_PARENT cannot be selected in SelectLayer");
+						return;
+					}
+
+					nodes.push(last_selected.to_node());
+					nodes.push(id);
+
 					// Fill the selection range
-					self.layer_metadata
-						.iter()
-						.filter(|(target, _)| self.graphene_document.layer_is_between(target, &layer_path, &self.layer_range_selection_reference))
-						.for_each(|(layer_path, _)| {
-							paths.push(layer_path.clone());
+					self.metadata()
+						.all_layers()
+						.skip_while(|&node| node != layer && node != last_selected)
+						.skip(1)
+						.take_while(|&node| node != layer && node != last_selected)
+						.for_each(|node| {
+							if node == LayerNodeIdentifier::ROOT_PARENT {
+								log::error!("ROOT_PARENT should not exist in all_layers")
+							} else {
+								nodes.push(node.to_node())
+							}
 						});
 				} else {
 					if ctrl {
 						// Toggle selection when holding ctrl
-						let layer = self.layer_metadata_mut(&layer_path);
-						layer.selected = !layer.selected;
-						responses.push_back(
-							LayerChanged {
-								affected_layer_path: layer_path.clone(),
-							}
-							.into(),
-						);
-						responses.push_back(BroadcastEvent::SelectionChanged.into());
+						if self.selected_nodes.selected_layers_contains(layer, self.metadata()) {
+							responses.add_front(NodeGraphMessage::SelectedNodesRemove { nodes: vec![id] });
+						} else {
+							responses.add_front(NodeGraphMessage::SelectedNodesAdd { nodes: vec![id] });
+						}
+						responses.add(BroadcastEvent::SelectionChanged);
 					} else {
-						paths.push(layer_path.clone());
+						nodes.push(id);
 					}
 
 					// Set our last selection reference
-					self.layer_range_selection_reference = layer_path;
+					self.layer_range_selection_reference = Some(layer);
 				}
 
 				// Don't create messages for empty operations
-				if !paths.is_empty() {
+				if !nodes.is_empty() {
 					// Add or set our selected layers
 					if ctrl {
-						responses.push_front(AddSelectedLayers { additional_layers: paths }.into());
+						responses.add_front(NodeGraphMessage::SelectedNodesAdd { nodes });
 					} else {
-						responses.push_front(SetSelectedLayers { replacement_selected_layers: paths }.into());
+						responses.add_front(NodeGraphMessage::SelectedNodesSet { nodes });
 					}
 				}
 			}
-			SetBlendModeForSelectedLayers { blend_mode } => {
-				self.backup(responses);
-				for path in self.selected_layers() {
-					responses.push_back(DocumentOperation::SetLayerBlendMode { path: path.to_vec(), blend_mode }.into());
+			DocumentMessage::SetBlendModeForSelectedLayers { blend_mode } => {
+				for layer in self.selected_nodes.selected_layers_except_artboards(self.metadata()) {
+					responses.add(GraphOperationMessage::BlendModeSet { layer, blend_mode });
 				}
 			}
-			SetImageBlobUrl {
-				layer_path,
-				blob_url,
-				resolution,
-				document_id,
-			} => {
-				let layer = self.graphene_document.layer(&layer_path).expect("Setting blob URL for invalid layer");
-
-				// Revoke the old blob URL
-				match &layer.data {
-					LayerDataType::Imaginate(imaginate) => {
-						if let Some(url) = &imaginate.blob_url {
-							responses.push_back(FrontendMessage::TriggerRevokeBlobUrl { url: url.clone() }.into());
-						}
-					}
-					LayerDataType::NodeGraphFrame(node_graph_frame) => {
-						if let Some(url) = &node_graph_frame.blob_url {
-							responses.push_back(FrontendMessage::TriggerRevokeBlobUrl { url: url.clone() }.into());
-						}
-					}
-					LayerDataType::Image(_) => {}
-					other => panic!(
-						"Setting blob URL for invalid layer type, which must be an `Imaginate`, `NodeGraphFrame` or `Image`. Found: `{:?}`",
-						other
-					),
-				}
-
-				responses.push_back(
-					PortfolioMessage::DocumentPassMessage {
-						document_id,
-						message: DocumentOperation::SetLayerBlobUrl { layer_path, blob_url, resolution }.into(),
-					}
-					.into(),
-				);
-			}
-			SetLayerExpansion { layer_path, set_expanded } => {
-				self.layer_metadata_mut(&layer_path).expanded = set_expanded;
-				responses.push_back(DocumentStructureChanged.into());
-				responses.push_back(LayerChanged { affected_layer_path: layer_path }.into())
-			}
-			SetLayerName { layer_path, name } => {
-				if let Some(layer) = self.layer_panel_entry_from_path(&layer_path, &persistent_data.font_cache) {
-					// Only save the history state if the name actually changed to something different
-					if layer.name != name {
-						self.backup(responses);
-						responses.push_back(DocumentOperation::SetLayerName { path: layer_path, name }.into());
-					}
-				}
-			}
-			SetOpacityForSelectedLayers { opacity } => {
+			DocumentMessage::SetOpacityForSelectedLayers { opacity } => {
 				self.backup(responses);
 				let opacity = opacity.clamp(0., 1.);
 
-				for path in self.selected_layers().map(|path| path.to_vec()) {
-					responses.push_back(DocumentOperation::SetLayerOpacity { path, opacity }.into());
+				for layer in self.selected_nodes.selected_layers_except_artboards(self.metadata()) {
+					responses.add(GraphOperationMessage::OpacitySet { layer, opacity });
 				}
 			}
-			SetOverlaysVisibility { visible } => {
+			DocumentMessage::SetOverlaysVisibility { visible } => {
 				self.overlays_visible = visible;
-				responses.push_back(OverlaysMessage::Rerender.into());
+				responses.add(BroadcastEvent::ToolAbort);
+				responses.add(OverlaysMessage::Draw);
 			}
-			SetSelectedLayers { replacement_selected_layers } => {
-				let selected = self.layer_metadata.iter_mut().filter(|(_, layer_metadata)| layer_metadata.selected);
-				selected.for_each(|(path, layer_metadata)| {
-					layer_metadata.selected = false;
-					responses.push_back(LayerChanged { affected_layer_path: path.clone() }.into())
-				});
-
-				let additional_layers = replacement_selected_layers;
-				responses.push_front(AddSelectedLayers { additional_layers }.into());
+			DocumentMessage::SetRangeSelectionLayer { new_layer } => {
+				self.layer_range_selection_reference = new_layer;
 			}
-			SetSnapping { snap } => {
-				self.snapping_enabled = snap;
-			}
-			SetTextboxEditability { path, editable } => {
-				let text = self.graphene_document.layer(&path).unwrap().as_text().unwrap();
-				responses.push_back(DocumentOperation::SetTextEditability { path, editable }.into());
-				if editable {
-					let color = if let Fill::Solid(solid_color) = text.path_style.fill() { *solid_color } else { Color::BLACK };
-					responses.push_back(
-						FrontendMessage::DisplayEditableTextbox {
-							text: text.text.clone(),
-							line_width: text.line_width,
-							font_size: text.size,
-							color,
-						}
-						.into(),
-					);
-				} else {
-					responses.push_back(FrontendMessage::DisplayRemoveEditableTextbox.into());
-				}
-			}
-			SetViewMode { view_mode } => {
-				self.view_mode = view_mode;
-				responses.push_front(DocumentMessage::DirtyRenderDocument.into());
-			}
-			StartTransaction => self.backup(responses),
-			ToggleLayerExpansion { layer_path } => {
-				self.layer_metadata_mut(&layer_path).expanded ^= true;
-				responses.push_back(DocumentStructureChanged.into());
-				responses.push_back(LayerChanged { affected_layer_path: layer_path }.into())
-			}
-			ToggleLayerVisibility { layer_path } => {
-				responses.push_back(DocumentOperation::ToggleLayerVisibility { path: layer_path }.into());
-				responses.push_back(BroadcastEvent::DocumentIsDirty.into());
-			}
-			ToggleSelectedHandleMirroring {
-				layer_path,
-				toggle_distance,
-				toggle_angle,
+			DocumentMessage::SetSnapping {
+				snapping_enabled,
+				bounding_box_snapping,
+				geometry_snapping,
 			} => {
-				responses.push_back(
-					DocumentOperation::SetSelectedHandleMirroring {
-						layer_path,
-						toggle_distance,
-						toggle_angle,
-					}
-					.into(),
-				);
-			}
-			Undo => {
-				responses.push_back(BroadcastEvent::ToolAbort.into());
-				responses.push_back(DocumentHistoryBackward.into());
-				responses.push_back(BroadcastEvent::DocumentIsDirty.into());
-				responses.push_back(RenderDocument.into());
-				responses.push_back(FolderChanged { affected_folder_path: vec![] }.into());
-			}
-			UngroupLayers { folder_path } => {
-				// Select all the children of the folder
-				let select = self.graphene_document.folder_children_paths(&folder_path);
+				if let Some(state) = snapping_enabled {
+					self.snapping_state.snapping_enabled = state
+				};
 
-				let message_buffer = [
-					// Select them
-					DocumentMessage::SetSelectedLayers { replacement_selected_layers: select }.into(),
-					// Copy them
-					PortfolioMessage::Copy { clipboard: Clipboard::Internal }.into(),
-					// Paste them into the folder above
-					PortfolioMessage::PasteIntoFolder {
-						clipboard: Clipboard::Internal,
-						folder_path: folder_path[..folder_path.len() - 1].to_vec(),
-						insert_index: -1,
-					}
-					.into(),
-					// Delete the parent folder
-					DocumentMessage::DeleteLayer { layer_path: folder_path }.into(),
-				];
+				if let Some(OptionBoundsSnapping {
+					edge_midpoints,
+					edges,
+					centers,
+					corners,
+				}) = bounding_box_snapping
+				{
+					if let Some(state) = edge_midpoints {
+						self.snapping_state.bounds.edge_midpoints = state
+					};
+					if let Some(state) = edges {
+						self.snapping_state.bounds.edges = state
+					};
+					if let Some(state) = centers {
+						self.snapping_state.bounds.centers = state
+					};
+					if let Some(state) = corners {
+						self.snapping_state.bounds.corners = state
+					};
+				}
 
-				// Push these messages in reverse due to push_front
-				for message in message_buffer.into_iter().rev() {
-					responses.push_front(message);
+				if let Some(OptionPointSnapping {
+					paths,
+					path_intersections,
+					anchors,
+					line_midpoints,
+					normals,
+					tangents,
+				}) = geometry_snapping
+				{
+					if let Some(state) = path_intersections {
+						self.snapping_state.nodes.path_intersections = state
+					};
+					if let Some(state) = paths {
+						self.snapping_state.nodes.paths = state
+					};
+					if let Some(state) = anchors {
+						self.snapping_state.nodes.anchors = state
+					};
+					if let Some(state) = line_midpoints {
+						self.snapping_state.nodes.line_midpoints = state
+					};
+					if let Some(state) = normals {
+						self.snapping_state.nodes.normals = state
+					};
+					if let Some(state) = tangents {
+						self.snapping_state.nodes.tangents = state
+					};
 				}
 			}
-			UngroupSelectedLayers => {
-				responses.push_back(DocumentMessage::StartTransaction.into());
-				let folder_paths = self.graphene_document.sorted_folders_by_depth(self.selected_layers());
-				for folder_path in folder_paths {
-					responses.push_back(DocumentMessage::UngroupLayers { folder_path: folder_path.to_vec() }.into());
+			DocumentMessage::SetViewMode { view_mode } => {
+				self.view_mode = view_mode;
+				responses.add_front(NodeGraphMessage::RunDocumentGraph);
+			}
+			DocumentMessage::StartTransaction => self.backup(responses),
+			DocumentMessage::ToggleLayerExpansion { id } => {
+				let layer = LayerNodeIdentifier::new(id, self.network());
+				if self.collapsed.0.contains(&layer) {
+					self.collapsed.0.retain(|&collapsed_layer| collapsed_layer != layer);
+				} else {
+					self.collapsed.0.push(layer);
 				}
-				responses.push_back(DocumentMessage::CommitTransaction.into());
+				responses.add(NodeGraphMessage::RunDocumentGraph);
 			}
-			UpdateLayerMetadata { layer_path, layer_metadata } => {
-				self.layer_metadata.insert(layer_path, layer_metadata);
+			DocumentMessage::ToggleGridVisibility => {
+				self.snapping_state.grid_snapping = !self.snapping_state.grid_snapping;
+				responses.add(OverlaysMessage::Draw);
+				responses.add(PortfolioMessage::UpdateDocumentWidgets);
 			}
-			ZoomCanvasTo100Percent => {
-				responses.push_front(NavigationMessage::SetCanvasZoom { zoom_factor: 1. }.into());
+			DocumentMessage::ToggleOverlaysVisibility => {
+				self.overlays_visible = !self.overlays_visible;
+				responses.add(OverlaysMessage::Draw);
+				responses.add(PortfolioMessage::UpdateDocumentWidgets);
 			}
-			ZoomCanvasTo200Percent => {
-				responses.push_front(NavigationMessage::SetCanvasZoom { zoom_factor: 2. }.into());
+			DocumentMessage::ToggleSnapping => {
+				self.snapping_state.snapping_enabled = !self.snapping_state.snapping_enabled;
+				responses.add(PortfolioMessage::UpdateDocumentWidgets);
 			}
-			ZoomCanvasToFitAll => {
-				if let Some(bounds) = self.document_bounds(&persistent_data.font_cache) {
-					responses.push_back(
-						NavigationMessage::FitViewportToBounds {
-							bounds,
-							padding_scale_factor: Some(VIEWPORT_ZOOM_TO_FIT_PADDING_SCALE_FACTOR),
-							prevent_zoom_past_100: true,
+			DocumentMessage::Undo => {
+				self.undo_in_progress = true;
+				responses.add(ToolMessage::PreUndo);
+				responses.add(DocumentMessage::DocumentHistoryBackward);
+				responses.add(OverlaysMessage::Draw);
+				responses.add(DocumentMessage::UndoFinished);
+				responses.add(ToolMessage::Undo);
+			}
+			DocumentMessage::UndoFinished => {
+				self.undo_in_progress = false;
+			}
+			DocumentMessage::UngroupSelectedLayers => {
+				responses.add(DocumentMessage::StartTransaction);
+
+				let folder_paths = self.metadata().folders_sorted_by_most_nested(self.selected_nodes.selected_layers(self.metadata()));
+				for folder in folder_paths {
+					if folder == LayerNodeIdentifier::ROOT_PARENT {
+						log::error!("ROOT_PARENT cannot be selected when ungrouping selected layers");
+						continue;
+					}
+					// Cannot ungroup artboard
+					let folder_node = self.network.nodes.get(&folder.to_node()).expect("Folder node should always exist");
+					if folder_node.is_artboard() {
+						return;
+					}
+
+					// Get first child layer node that feeds into the secondary input for the folder
+					let Some(child_layer) = folder.first_child(&self.metadata) else {
+						log::error!("Folder should always have a child");
+						return;
+					};
+
+					// Move child_layer stack x position to folder stack
+					let child_layer_node = self.network.nodes.get(&child_layer.to_node()).expect("Child node should always exist for layer");
+					let offset = folder_node.metadata.position - child_layer_node.metadata.position;
+					responses.add(GraphOperationMessage::ShiftUpstream {
+						node_id: child_layer.to_node(),
+						shift: offset,
+						shift_self: true,
+					});
+
+					// Set the primary input for the node downstream of folder to the first layer node
+					// TODO: downstream node can be none if it is the root node. A layer group connected directly to the export cannot be ungrouped
+					let Some((downstream_node_id, downstream_input_index)) = DocumentMessageHandler::get_downstream_node(&self.network, &self.metadata, folder) else {
+						log::error!("Downstream node should always exist when moving layer");
+						continue;
+					};
+
+					// Output_index must be 0 since layers only have 1 output
+					let downstream_input = NodeInput::node(child_layer.to_node(), 0);
+					responses.add(GraphOperationMessage::SetNodeInput {
+						node_id: downstream_node_id,
+						input_index: downstream_input_index,
+						input: downstream_input,
+					});
+
+					// Get the node that feeds into the primary input for the folder (if it exists)
+					if let Some(NodeInput::Node { node_id, .. }) = self.network.nodes.get(&folder.to_node()).expect("Folder should always exist").inputs.get(0) {
+						let upstream_sibling_id = *node_id;
+
+						// Get the node at the bottom of the first layer node stack
+						let mut last_child_node_id = child_layer.to_node();
+						loop {
+							let Some(NodeInput::Node { node_id, .. }) = self.network.nodes.get(&last_child_node_id).expect("Child node should always exist").inputs.get(0) else {
+								break;
+							};
+							last_child_node_id = *node_id;
 						}
-						.into(),
-					)
+
+						// Connect the primary input of the bottom layer of the node to the upstream sibling
+						let bottom_layer_node_input = NodeInput::node(upstream_sibling_id, 0);
+						responses.add(GraphOperationMessage::SetNodeInput {
+							node_id: last_child_node_id,
+							input_index: 0,
+							input: bottom_layer_node_input,
+						});
+
+						// Shift upstream_sibling down by the height of the child layer stack
+						let top_of_stack = self.network.nodes.get(&child_layer.to_node()).expect("Child layer should always exist for child layer id");
+						let bottom_of_stack = self.network.nodes.get(&child_layer.to_node()).expect("Last child layer should always exist for last child layer id");
+						let target_distance = bottom_of_stack.metadata.position.y - top_of_stack.metadata.position.y;
+
+						let folder_node = self.network.nodes.get(&folder.to_node()).expect("Folder node should always exist");
+						let upstream_sibling_node = self.network.nodes.get(&upstream_sibling_id).expect("Upstream sibling node should always exist");
+						let current_distance = upstream_sibling_node.metadata.position.y - folder_node.metadata.position.y;
+
+						let y_offset = target_distance - current_distance + 3;
+						responses.add(GraphOperationMessage::ShiftUpstream {
+							node_id: upstream_sibling_id,
+							shift: IVec2::new(0, y_offset),
+							shift_self: true,
+						});
+					}
+
+					// Delete folder and all horizontal inputs, also deletes node in metadata
+					responses.add(GraphOperationMessage::DeleteLayer { layer: folder, reconnect: true });
+				}
+
+				responses.add(NodeGraphMessage::RunDocumentGraph);
+				responses.add(DocumentMessage::DocumentStructureChanged);
+				responses.add(NodeGraphMessage::SendGraph);
+			}
+			DocumentMessage::UpdateDocumentTransform { transform } => {
+				responses.add(DocumentMessage::RenderRulers);
+				responses.add(DocumentMessage::RenderScrollbars);
+
+				if !self.graph_view_overlay_open {
+					self.metadata.document_to_viewport = transform;
+
+					responses.add(NodeGraphMessage::RunDocumentGraph);
+				} else {
+					let Some(network) = self.network.nested_network_mut(&self.node_graph_handler.network) else {
+						log::error!("Nested network not found in UpdateDocumentTransform");
+						return;
+					};
+					network.node_graph_to_viewport = transform;
+
+					responses.add(FrontendMessage::UpdateNodeGraphTransform {
+						transform: Transform {
+							scale: transform.matrix2.x_axis.x,
+							x: transform.translation.x,
+							y: transform.translation.y,
+						},
+					})
+				}
+
+				responses.add(PortfolioMessage::UpdateDocumentWidgets);
+			}
+			DocumentMessage::ZoomCanvasTo100Percent => {
+				responses.add_front(NavigationMessage::CanvasZoomSet { zoom_factor: 1. });
+			}
+			DocumentMessage::ZoomCanvasTo200Percent => {
+				responses.add_front(NavigationMessage::CanvasZoomSet { zoom_factor: 2. });
+			}
+			DocumentMessage::ZoomCanvasToFitAll => {
+				let bounds = if self.graph_view_overlay_open {
+					self.node_graph_handler
+						.network_metadata
+						.get(&self.node_graph_handler.network)
+						.and_then(|network_metadata| network_metadata.bounding_box_subpath.as_ref().and_then(|subpath| subpath.bounding_box()))
+				} else {
+					self.metadata().document_bounds_document_space(true)
+				};
+				if let Some(bounds) = bounds {
+					responses.add(NavigationMessage::CanvasTiltSet { angle_radians: 0. });
+					responses.add(NavigationMessage::FitViewportToBounds { bounds, prevent_zoom_past_100: true });
 				}
 			}
+			DocumentMessage::Noop => (),
 		}
 	}
 
 	fn actions(&self) -> ActionList {
 		let mut common = actions!(DocumentMessageDiscriminant;
-			Undo,
-			Redo,
-			SelectAllLayers,
-			DeselectAllLayers,
-			RenderDocument,
-			ExportDocument,
-			SaveDocument,
-			SetSnapping,
+			CreateEmptyFolder,
 			DebugPrintDocument,
-			ZoomCanvasToFitAll,
+			DeselectAllLayers,
+			GraphViewOverlayToggle,
+			Noop,
+			Redo,
+			SaveDocument,
+			SelectAllLayers,
+			SetSnapping,
+			ToggleGridVisibility,
+			ToggleOverlaysVisibility,
+			ToggleSnapping,
+			Undo,
 			ZoomCanvasTo100Percent,
 			ZoomCanvasTo200Percent,
-			CreateEmptyFolder,
+			ZoomCanvasToFitAll,
 		);
 
-		if self.layer_metadata.values().any(|data| data.selected) {
+		// Additional actions if there are any selected layers
+		if self.selected_nodes.selected_layers(self.metadata()).next().is_some() {
 			let select = actions!(DocumentMessageDiscriminant;
 				DeleteSelectedLayers,
 				DuplicateSelectedLayers,
+				GroupSelectedLayers,
 				NudgeSelectedLayers,
 				SelectedLayersLower,
 				SelectedLayersLowerToBack,
 				SelectedLayersRaise,
 				SelectedLayersRaiseToFront,
-				GroupSelectedLayers,
 				UngroupSelectedLayers,
 			);
 			common.extend(select);
 		}
+		// Additional actions if the node graph is open
+		if self.graph_view_overlay_open {
+			common.extend(actions!(DocumentMessageDiscriminant;
+				GraphViewOverlay,
+			));
+			common.extend(self.node_graph_handler.actions_additional_if_node_graph_is_open());
+		}
+		// More additional actions
 		common.extend(self.navigation_handler.actions());
-		common.extend(self.transform_layer_handler.actions());
 		common.extend(self.node_graph_handler.actions());
+		common.extend(actions!(GraphOperationMessageDiscriminant; ToggleSelectedLocked, ToggleSelectedVisibility));
 		common
 	}
 }
 
 impl DocumentMessageHandler {
-	pub fn call_imaginate(&mut self, document_id: u64, preferences: &PreferencesMessageHandler, persistent_data: &PersistentData) -> Option<Message> {
-		let layer_path = {
-			let mut selected_imaginate_layers = self.selected_layers_with_type(LayerDataTypeDiscriminant::Imaginate);
-
-			// Get what is hopefully the only selected Imaginate layer
-			match selected_imaginate_layers.next() {
-				// Continue only if there are no additional Imaginate layers also selected
-				Some(layer_path) if selected_imaginate_layers.next().is_none() => layer_path.to_owned(),
-				_ => return None,
-			}
-		};
-
-		// Prepare the Imaginate parameters and base image
-
-		let transform = self.graphene_document.root.transform.inverse() * self.graphene_document.multiply_transforms(&layer_path).unwrap();
-		let layer = self.graphene_document.layer(&layer_path).unwrap();
-		let imaginate_layer = layer.as_imaginate().unwrap();
-
-		let parameters = ImaginateGenerationParameters {
-			seed: imaginate_layer.seed,
-			samples: imaginate_layer.samples,
-			sampling_method: imaginate_layer.sampling_method.api_value().to_string(),
-			denoising_strength: imaginate_layer.use_img2img.then_some(imaginate_layer.denoising_strength),
-			cfg_scale: imaginate_layer.cfg_scale,
-			prompt: imaginate_layer.prompt.clone(),
-			negative_prompt: imaginate_layer.negative_prompt.clone(),
-			resolution: pick_layer_safe_imaginate_resolution(layer, &persistent_data.font_cache),
-			restore_faces: imaginate_layer.restore_faces,
-			tiling: imaginate_layer.tiling,
-		};
-		let mask_paint_mode = imaginate_layer.mask_paint_mode;
-		let mask_blur_px = imaginate_layer.mask_blur_px;
-		let mask_fill_content = imaginate_layer.mask_fill_content;
-		let (base_image, mask_image) = if imaginate_layer.use_img2img {
-			let mask = imaginate_layer.mask_layer_ref.clone();
-
-			// Calculate the size of the region to be exported
-			let size = DVec2::new(transform.transform_vector2(DVec2::new(1., 0.)).length(), transform.transform_vector2(DVec2::new(0., 1.)).length());
-
-			let old_transforms = self.remove_document_transform();
-			let svg = self.render_document(size, transform.inverse(), persistent_data, DocumentRenderMode::OnlyBelowLayerInFolder(&layer_path));
-
-			let mask_is_some = mask.is_some();
-			let mask_image = mask.and_then(|mask_layer_path| match self.graphene_document.layer(&mask_layer_path) {
-				Ok(_) => {
-					let svg = self.render_document(size, transform.inverse(), persistent_data, DocumentRenderMode::LayerCutout(&mask_layer_path, Color::WHITE));
-
-					Some(ImaginateBaseImage { svg, size })
-				}
-				Err(_) => None,
-			});
-
-			if mask_is_some && mask_image.is_none() {
-				return Some(
-					DialogMessage::DisplayDialogError {
-						title: "Masking layer is missing".into(),
-						description: "
-							It may have been deleted or moved. Please drag a new layer reference\n\
-							into the 'Masking Layer' parameter input, then generate again."
-							.trim()
-							.into(),
-					}
-					.into(),
-				);
-			}
-
-			self.restore_document_transform(old_transforms);
-			(Some(ImaginateBaseImage { svg, size }), mask_image)
-		} else {
-			(None, None)
-		};
-
-		Some(
-			FrontendMessage::TriggerImaginateGenerate {
-				parameters,
-				base_image,
-				mask_image,
-				mask_paint_mode,
-				mask_blur_px,
-				mask_fill_content,
-				hostname: preferences.imaginate_server_hostname.clone(),
-				refresh_frequency: preferences.imaginate_refresh_frequency,
-				document_id,
-				layer_path,
-			}
-			.into(),
-		)
+	/// Runs an intersection test with all layers and a viewport space quad
+	pub fn intersect_quad<'a>(&'a self, viewport_quad: graphene_core::renderer::Quad, network: &'a NodeNetwork) -> impl Iterator<Item = LayerNodeIdentifier> + 'a {
+		let document_quad = self.metadata.document_to_viewport.inverse() * viewport_quad;
+		self.metadata
+			.all_layers()
+			.filter(|&layer| self.selected_nodes.layer_visible(layer, self.metadata()))
+			.filter(|&layer| !self.selected_nodes.layer_locked(layer, self.metadata()))
+			.filter(|&layer| !is_artboard(layer, network))
+			.filter_map(|layer| self.metadata.click_target(layer).map(|targets| (layer, targets)))
+			.filter(move |(layer, target)| target.iter().any(move |target| target.intersect_rectangle(document_quad, self.metadata.transform_to_document(*layer))))
+			.map(|(layer, _)| layer)
 	}
 
-	pub fn call_node_graph_frame(&mut self, document_id: u64, _preferences: &PreferencesMessageHandler, persistent_data: &PersistentData) -> Option<Message> {
-		let layer_path = {
-			let mut selected_nodegraph_layers = self.selected_layers_with_type(LayerDataTypeDiscriminant::NodeGraphFrame);
-
-			// Get what is hopefully the only selected nodegraph layer
-			match selected_nodegraph_layers.next() {
-				// Continue only if there are no additional nodegraph layers also selected
-				Some(layer_path) if selected_nodegraph_layers.next().is_none() => layer_path.to_owned(),
-				_ => return None,
-			}
-		};
-
-		// Prepare the node graph base image base image
-
-		// Calculate the size of the region to be exported
-
-		let old_transforms = self.remove_document_transform();
-		let transform = self.graphene_document.multiply_transforms(&layer_path).unwrap();
-		let size = DVec2::new(transform.transform_vector2(DVec2::new(1., 0.)).length(), transform.transform_vector2(DVec2::new(0., 1.)).length());
-
-		let svg = self.render_document(size, transform.inverse(), persistent_data, DocumentRenderMode::OnlyBelowLayerInFolder(&layer_path));
-		self.restore_document_transform(old_transforms);
-
-		Some(FrontendMessage::TriggerNodeGraphFrameGenerate { document_id, layer_path, svg, size }.into())
+	/// Find all of the layers that were clicked on from a viewport space location
+	pub fn click_xray(&self, viewport_location: DVec2) -> impl Iterator<Item = LayerNodeIdentifier> + '_ {
+		let point = self.metadata.document_to_viewport.inverse().transform_point2(viewport_location);
+		self.metadata
+			.all_layers()
+			.filter(|&layer| self.selected_nodes.layer_visible(layer, self.metadata()))
+			.filter(|&layer| !self.selected_nodes.layer_locked(layer, self.metadata()))
+			.filter_map(|layer| self.metadata.click_target(layer).map(|targets| (layer, targets)))
+			.filter(move |(layer, target)| target.iter().any(|target: &ClickTarget| target.intersect_point(point, self.metadata.transform_to_document(*layer))))
+			.map(|(layer, _)| layer)
 	}
 
-	/// Remove the artwork and artboard pan/tilt/zoom to render it without the user's viewport navigation, and save it to be restored at the end
-	fn remove_document_transform(&mut self) -> [DAffine2; 2] {
-		let old_artwork_transform = self.graphene_document.root.transform;
-		self.graphene_document.root.transform = DAffine2::IDENTITY;
-		GrapheneDocument::mark_children_as_dirty(&mut self.graphene_document.root);
-
-		let old_artboard_transform = self.artboard_message_handler.artboards_graphene_document.root.transform;
-		self.artboard_message_handler.artboards_graphene_document.root.transform = DAffine2::IDENTITY;
-		GrapheneDocument::mark_children_as_dirty(&mut self.artboard_message_handler.artboards_graphene_document.root);
-
-		[old_artwork_transform, old_artboard_transform]
-	}
-
-	/// Transform the artwork and artboard back to their original scales
-	fn restore_document_transform(&mut self, [old_artwork_transform, old_artboard_transform]: [DAffine2; 2]) {
-		self.graphene_document.root.transform = old_artwork_transform;
-		GrapheneDocument::mark_children_as_dirty(&mut self.graphene_document.root);
-
-		self.artboard_message_handler.artboards_graphene_document.root.transform = old_artboard_transform;
-		GrapheneDocument::mark_children_as_dirty(&mut self.artboard_message_handler.artboards_graphene_document.root);
-	}
-
-	pub fn render_document(&mut self, size: DVec2, transform: DAffine2, persistent_data: &PersistentData, render_mode: DocumentRenderMode) -> String {
-		// Render the document SVG code
-
-		let render_data = RenderData::new(ViewMode::Normal, &persistent_data.font_cache, None);
-
-		let (artwork, outside) = match render_mode {
-			DocumentRenderMode::Root => (self.graphene_document.render_root(render_data), None),
-			DocumentRenderMode::OnlyBelowLayerInFolder(below_layer_path) => (self.graphene_document.render_layers_below(below_layer_path, render_data).unwrap(), None),
-			DocumentRenderMode::LayerCutout(layer_path, background) => (self.graphene_document.render_layer(layer_path, render_data).unwrap(), Some(background)),
-		};
-		let artboards = self.artboard_message_handler.artboards_graphene_document.render_root(render_data);
-		let outside_artboards_color = outside.map_or_else(
-			|| if self.artboard_message_handler.artboard_ids.is_empty() { "ffffff" } else { "222222" }.to_string(),
-			|col| col.rgba_hex(),
-		);
-		let outside_artboards = format!(r##"<rect x="0" y="0" width="100%" height="100%" fill="#{}" />"##, outside_artboards_color);
-		let matrix = transform
-			.to_cols_array()
+	/// Find the deepest layer given in the sorted array (by returning the one which is not a folder from the list of layers under the click location).
+	pub fn find_deepest(&self, node_list: &[LayerNodeIdentifier], network: &NodeNetwork) -> Option<LayerNodeIdentifier> {
+		node_list
 			.iter()
-			.enumerate()
-			.fold(String::new(), |accum, (i, entry)| accum + &(entry.to_string() + if i == 5 { "" } else { "," }));
-		let svg = format!(
-			r#"<svg xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none" viewBox="0 0 1 1" width="{}" height="{}">{}{}<g transform="matrix({})">{}{}</g></svg>"#,
-			size.x, size.y, "\n", outside_artboards, matrix, artboards, artwork
-		);
+			.find(|&&layer| {
+				if layer != LayerNodeIdentifier::ROOT_PARENT {
+					!network.nodes.get(&layer.to_node()).map(|node| node.layer_has_child_layers(network)).unwrap_or_default()
+				} else {
+					log::error!("ROOT_PARENT should not exist in find_deepest");
+					false
+				}
+			})
+			.copied()
+	}
 
-		svg
+	/// Find any layers sorted by index that are under the given location in viewport space.
+	pub fn click_list_any(&self, viewport_location: DVec2, network: &NodeNetwork) -> Vec<LayerNodeIdentifier> {
+		self.click_xray(viewport_location).filter(|&layer| !is_artboard(layer, network)).collect::<Vec<_>>()
+	}
+
+	/// Find layers under the location in viewport space that was clicked, listed by their depth in the layer tree hierarchy.
+	pub fn click_list(&self, viewport_location: DVec2, network: &NodeNetwork) -> Vec<LayerNodeIdentifier> {
+		let mut node_list = self.click_list_any(viewport_location, network);
+		node_list.truncate(
+			node_list
+				.iter()
+				.position(|&layer| {
+					if layer != LayerNodeIdentifier::ROOT_PARENT {
+						!network.nodes.get(&layer.to_node()).map(|node| node.layer_has_child_layers(network)).unwrap_or_default()
+					} else {
+						log::error!("ROOT_PARENT should not exist in click_list_any");
+						false
+					}
+				})
+				.unwrap_or(0) + 1,
+		);
+		node_list
+	}
+
+	/// Find the deepest layer that has been clicked on from a location in viewport space.
+	pub fn click(&self, viewport_location: DVec2, network: &NodeNetwork) -> Option<LayerNodeIdentifier> {
+		self.click_list(viewport_location, network).last().copied()
+	}
+
+	/// Get the combined bounding box of the click targets of the selected visible layers in viewport space
+	pub fn selected_visible_layers_bounding_box_viewport(&self) -> Option<[DVec2; 2]> {
+		self.selected_nodes
+			.selected_visible_layers(self.metadata())
+			.filter_map(|layer| self.metadata.bounding_box_viewport(layer))
+			.reduce(graphene_core::renderer::Quad::combine_bounds)
+	}
+
+	/// Get the combined bounding box of the click targets of the selected nodes in the node graph in viewport space
+	pub fn selected_nodes_bounding_box_viewport(&self) -> Option<[DVec2; 2]> {
+		let Some(network) = self.network.nested_network(&self.node_graph_handler.network) else {
+			log::error!("Could not get nested network in selected_nodes_bounding_box_viewport");
+			return None;
+		};
+
+		self.selected_nodes
+			.selected_nodes(network)
+			.filter_map(|node| {
+				let mut node_path = self.node_graph_handler.network.clone();
+				node_path.push(*node);
+				let Some(node_metadata) = self.node_graph_handler.node_metadata.get(&node_path) else {
+					log::debug!("Could not get click target for node {node}");
+					return None;
+				};
+				let Some(network_metadata) = self.node_graph_handler.network_metadata.get(&self.node_graph_handler.network) else {
+					log::debug!("Could not get network_metadata in selected_nodes_bounding_box_viewport");
+					return None;
+				};
+				node_metadata.node_click_target.subpath.bounding_box_with_transform(network_metadata.node_graph_to_viewport)
+			})
+			.reduce(graphene_core::renderer::Quad::combine_bounds)
+	}
+
+	pub fn selected_visible_and_unlock_layers_bounding_box_viewport(&self) -> Option<[DVec2; 2]> {
+		self.selected_nodes
+			.selected_visible_and_unlocked_layers(self.metadata())
+			.filter_map(|layer| self.metadata.bounding_box_viewport(layer))
+			.reduce(graphene_core::renderer::Quad::combine_bounds)
+	}
+
+	pub fn network(&self) -> &NodeNetwork {
+		&self.network
+	}
+
+	pub fn metadata(&self) -> &DocumentMetadata {
+		&self.metadata
 	}
 
 	pub fn serialize_document(&self) -> String {
@@ -1106,166 +1310,117 @@ impl DocumentMessageHandler {
 		val.unwrap()
 	}
 
-	pub fn deserialize_document(serialized_content: &str) -> Result<Self, DocumentError> {
-		let deserialized_result: Result<Self, DocumentError> = serde_json::from_str(serialized_content).map_err(|e| DocumentError::InvalidFile(e.to_string()));
-		match deserialized_result {
-			Ok(document) => {
-				if document.version == GRAPHITE_DOCUMENT_VERSION {
-					Ok(document)
-				} else {
-					Err(DocumentError::InvalidFile("Graphite document version mismatch".to_string()))
+	pub fn deserialize_document(serialized_content: &str) -> Result<Self, EditorError> {
+		// serde_json::from_str(serialized_content).map_err(|e| EditorError::DocumentDeserialization(e.to_string()))
+
+		match serde_json::from_str::<Self>(serialized_content).map_err(|e| EditorError::DocumentDeserialization(e.to_string())) {
+			Ok(mut document) => {
+				for (_, node) in &mut document.network.nodes {
+					// Upgrade Fill nodes to the format change in #1778
+					// TODO: Eventually remove this (probably starting late 2024)
+					if node.name == "Fill" && node.inputs.len() == 8 {
+						let node_definition = crate::messages::portfolio::document::node_graph::document_node_types::resolve_document_node_type(&node.name).unwrap();
+						let default_definition_node = node_definition.default_document_node();
+
+						node.implementation = default_definition_node.implementation.clone();
+						let old_inputs = std::mem::replace(&mut node.inputs, default_definition_node.inputs.clone());
+
+						node.inputs[0] = old_inputs[0].clone();
+
+						let Some(fill_type) = old_inputs[1].as_value().cloned() else { continue };
+						let TaggedValue::FillType(fill_type) = fill_type else { continue };
+						let Some(solid_color) = old_inputs[2].as_value().cloned() else { continue };
+						let TaggedValue::OptionalColor(solid_color) = solid_color else { continue };
+						let Some(gradient_type) = old_inputs[3].as_value().cloned() else { continue };
+						let TaggedValue::GradientType(gradient_type) = gradient_type else { continue };
+						let Some(start) = old_inputs[4].as_value().cloned() else { continue };
+						let TaggedValue::DVec2(start) = start else { continue };
+						let Some(end) = old_inputs[5].as_value().cloned() else { continue };
+						let TaggedValue::DVec2(end) = end else { continue };
+						let Some(transform) = old_inputs[6].as_value().cloned() else { continue };
+						let TaggedValue::DAffine2(transform) = transform else { continue };
+						let Some(positions) = old_inputs[7].as_value().cloned() else { continue };
+						let TaggedValue::GradientStops(positions) = positions else { continue };
+
+						let fill = match (fill_type, solid_color) {
+							(FillType::Solid, None) => Fill::None,
+							(FillType::Solid, Some(color)) => Fill::Solid(color),
+							(FillType::Gradient, _) => Fill::Gradient(Gradient {
+								stops: positions,
+								gradient_type,
+								start,
+								end,
+								transform,
+							}),
+						};
+						node.inputs[1] = NodeInput::value(TaggedValue::Fill(fill.clone()), false);
+						match fill {
+							Fill::None => {
+								node.inputs[2] = NodeInput::value(TaggedValue::OptionalColor(None), false);
+							}
+							Fill::Solid(color) => {
+								node.inputs[2] = NodeInput::value(TaggedValue::OptionalColor(Some(color)), false);
+							}
+							Fill::Gradient(gradient) => {
+								node.inputs[3] = NodeInput::value(TaggedValue::Gradient(gradient), false);
+							}
+						}
+					}
 				}
+				Ok(document)
 			}
 			Err(e) => Err(e),
 		}
+
+		// TODO: This can be used, if uncommented, to upgrade demo artwork with outdated document node internals from their definitions. Delete when it's no longer needed.
+		// Used for upgrading old internal networks for demo artwork nodes. Will reset all node internals for any opened file
+		// match serde_json::from_str::<Self>(serialized_content).map_err(|e| EditorError::DocumentDeserialization(e.to_string())) {
+		// 	Ok(mut document) => {
+		// 		for (_, node) in &mut document.network.nodes {
+		// 			let node_definition = crate::messages::portfolio::document::node_graph::document_node_types::resolve_document_node_type(&node.name).unwrap();
+		// 			let default_definition_node = node_definition.default_document_node();
+
+		// 			node.implementation = default_definition_node.implementation.clone();
+		// 		}
+		// 		Ok(document)
+		// 	}
+		// 	Err(e) => Err(e),
+		// }
 	}
 
-	pub fn with_name(name: String, ipp: &InputPreprocessorMessageHandler) -> Self {
+	pub fn with_name(name: String, ipp: &InputPreprocessorMessageHandler, responses: &mut VecDeque<Message>) -> Self {
 		let mut document = Self { name, ..Self::default() };
-		let starting_root_transform = document.navigation_handler.calculate_offset_transform(ipp.viewport_bounds.size() / 2.);
-		document.graphene_document.root.transform = starting_root_transform;
-		document.artboard_message_handler.artboards_graphene_document.root.transform = starting_root_transform;
+		let transform = document.navigation_handler.calculate_offset_transform(ipp.viewport_bounds.size() / 2., DVec2::ZERO, 0., 1.);
+		document.metadata.document_to_viewport = transform;
+		responses.add(DocumentMessage::UpdateDocumentTransform { transform });
+
 		document
 	}
 
 	pub fn with_name_and_content(name: String, serialized_content: String) -> Result<Self, EditorError> {
-		match Self::deserialize_document(&serialized_content) {
-			Ok(mut document) => {
-				document.name = name;
-				Ok(document)
-			}
-			Err(DocumentError::InvalidFile(msg)) => Err(EditorError::Document(msg)),
-			_ => Err(EditorError::Document(String::from("Failed to open file"))),
-		}
+		let mut document = Self::deserialize_document(&serialized_content)?;
+		document.name = name;
+		Ok(document)
 	}
 
-	pub fn is_unmodified_default(&self) -> bool {
-		self.serialize_root().len() == Self::default().serialize_root().len()
-			&& self.document_undo_history.is_empty()
-			&& self.document_redo_history.is_empty()
-			&& self.name.starts_with(DEFAULT_DOCUMENT_NAME)
-	}
-
-	fn select_layer(&mut self, path: &[LayerId], font_cache: &FontCache) -> Option<Message> {
-		println!("Select_layer fail: {:?}", self.all_layers_sorted());
-
-		if let Some(layer) = self.layer_metadata.get_mut(path) {
-			layer.selected = true;
-			let data = self.layer_panel_entry(path.to_vec(), font_cache).ok()?;
-			(!path.is_empty()).then(|| FrontendMessage::UpdateDocumentLayerDetails { data }.into())
-		} else {
-			warn!("Tried to select non existing layer {:?}", path);
-			None
-		}
-	}
-
-	pub fn selected_visible_layers_bounding_box(&self, font_cache: &FontCache) -> Option<[DVec2; 2]> {
-		let paths = self.selected_visible_layers();
-		self.graphene_document.combined_viewport_bounding_box(paths, font_cache)
-	}
-
-	pub fn artboard_bounding_box_and_transform(&self, path: &[LayerId], font_cache: &FontCache) -> Option<([DVec2; 2], DAffine2)> {
-		self.artboard_message_handler.artboards_graphene_document.bounding_box_and_transform(path, font_cache).unwrap_or(None)
-	}
-
-	pub fn selected_layers(&self) -> impl Iterator<Item = &[LayerId]> {
-		self.layer_metadata.iter().filter_map(|(path, data)| data.selected.then_some(path.as_slice()))
-	}
-
-	pub fn selected_layers_with_type(&self, discriminant: LayerDataTypeDiscriminant) -> impl Iterator<Item = &[LayerId]> {
-		self.selected_layers().filter(move |path| {
-			self.graphene_document
-				.layer(path)
-				.map(|layer| LayerDataTypeDiscriminant::from(&layer.data) == discriminant)
-				.unwrap_or(false)
-		})
-	}
-
-	pub fn non_selected_layers(&self) -> impl Iterator<Item = &[LayerId]> {
-		self.layer_metadata.iter().filter_map(|(path, data)| (!data.selected).then_some(path.as_slice()))
-	}
-
-	pub fn selected_layers_without_children(&self) -> Vec<&[LayerId]> {
-		let unique_layers = GrapheneDocument::shallowest_unique_layers(self.selected_layers());
-
-		// We need to maintain layer ordering
-		self.sort_layers(unique_layers.iter().copied())
-	}
-
-	pub fn selected_layers_contains(&self, path: &[LayerId]) -> bool {
-		self.layer_metadata.get(path).map(|layer| layer.selected).unwrap_or(false)
-	}
-
-	pub fn selected_visible_layers(&self) -> impl Iterator<Item = &[LayerId]> {
-		self.selected_layers().filter(|path| match self.graphene_document.layer(path) {
-			Ok(layer) => layer.visible,
-			Err(_) => false,
-		})
-	}
-
-	pub fn selected_visible_text_layers(&self) -> impl Iterator<Item = &[LayerId]> {
-		self.selected_layers().filter(|path| match self.graphene_document.layer(path) {
-			Ok(layer) => {
-				let discriminant: LayerDataTypeDiscriminant = (&layer.data).into();
-				layer.visible && discriminant == LayerDataTypeDiscriminant::Text
-			}
-			Err(_) => false,
-		})
-	}
-
-	pub fn visible_layers(&self) -> impl Iterator<Item = &[LayerId]> {
-		self.all_layers().filter(|path| match self.graphene_document.layer(path) {
-			Ok(layer) => layer.visible,
-			Err(_) => false,
-		})
-	}
-
-	/// Returns a copy of all the currently selected [Subpath]s.
-	pub fn selected_subpaths(&self) -> Vec<Subpath> {
-		self.selected_visible_layers()
-			.flat_map(|layer| self.graphene_document.layer(layer))
-			.flat_map(|layer| layer.as_subpath_copy())
-			.collect::<Vec<Subpath>>()
-	}
-
-	/// Returns references to all the currently selected [Subpath]s.
-	pub fn selected_subpaths_ref(&self) -> Vec<&Subpath> {
-		self.selected_visible_layers()
-			.flat_map(|layer| self.graphene_document.layer(layer))
-			.flat_map(|layer| layer.as_subpath())
-			.collect::<Vec<&Subpath>>()
-	}
-
-	/// Returns the bounding boxes for all visible layers and artboards, optionally excluding any paths.
-	pub fn bounding_boxes<'a>(&'a self, ignore_document: Option<&'a Vec<Vec<LayerId>>>, ignore_artboard: Option<LayerId>, font_cache: &'a FontCache) -> impl Iterator<Item = [DVec2; 2]> + 'a {
-		self.visible_layers()
-			.filter(move |path| ignore_document.map_or(true, |ignore_document| !ignore_document.iter().any(|ig| ig.as_slice() == *path)))
-			.filter_map(|path| self.graphene_document.viewport_bounding_box(path, font_cache).ok()?)
-			.chain(
-				self.artboard_message_handler
-					.artboard_ids
-					.iter()
-					.filter(move |&&id| Some(id) != ignore_artboard)
-					.filter_map(|&path| self.artboard_message_handler.artboards_graphene_document.viewport_bounding_box(&[path], font_cache).ok()?),
-			)
-	}
-
-	fn serialize_structure(&self, folder: &FolderLayer, structure: &mut Vec<u64>, data: &mut Vec<LayerId>, path: &mut Vec<LayerId>) {
+	/// Called recursively by the entry function [`serialize_root`].
+	fn serialize_structure(&self, folder: LayerNodeIdentifier, structure_section: &mut Vec<u64>, data_section: &mut Vec<u64>, path: &mut Vec<LayerNodeIdentifier>) {
 		let mut space = 0;
-		for (id, layer) in folder.layer_ids.iter().zip(folder.layers()).rev() {
-			data.push(*id);
+		for layer_node in folder.children(self.metadata()) {
+			data_section.push(layer_node.to_node().0);
 			space += 1;
-			if let LayerDataType::Folder(ref folder) = layer.data {
-				path.push(*id);
-				if self.layer_metadata(path).expanded {
-					structure.push(space);
-					self.serialize_structure(folder, structure, data, path);
-					space = 0;
-				}
+			if layer_node.has_children(self.metadata()) && !self.collapsed.0.contains(&layer_node) {
+				path.push(layer_node);
+
+				// TODO: Skip if folder is not expanded.
+				structure_section.push(space);
+				self.serialize_structure(layer_node, structure_section, data_section, path);
+				space = 0;
+
 				path.pop();
 			}
 		}
-		structure.push(space | 1 << 63);
+		structure_section.push(space | 1 << 63);
 	}
 
 	/// Serializes the layer structure into a condensed 1D structure.
@@ -1273,17 +1428,18 @@ impl DocumentMessageHandler {
 	/// # Format
 	/// It is a string of numbers broken into three sections:
 	///
-	/// | Data                                                                                                                           | Description                                  | Length           |
-	/// |--------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------|------------------|
-	/// | `4,` `2, 1, -2, -0,` `16533113728871998040,3427872634365736244,18115028555707261608,15878401910454357952,449479075714955186`   | Encoded example data                         |                  |
-	/// | `L` = `4` = `structure.len()`                                                                                                  | `L`, the length of the **Structure** section | First value      |
-	/// | **Structure** section = `2, 1, -2, -0`                                                                                         | The **Structure** section                    | Next `L` values  |
-	/// | **Data** section = `16533113728871998040, 3427872634365736244, 18115028555707261608, 15878401910454357952, 449479075714955186` | The **Data** section (layer IDs)             | Remaining values |
+	/// | Data                                                                                                                          | Description                                                   | Length           |
+	/// |------------------------------------------------------------------------------------------------------------------------------ |---------------------------------------------------------------|------------------|
+	/// | `4,` `2, 1, -2, -0,` `16533113728871998040,3427872634365736244,18115028555707261608,15878401910454357952,449479075714955186`  | Encoded example data                                          |                  |
+	/// | _____________________________________________________________________________________________________________________________ | _____________________________________________________________ | ________________ |
+	/// | **Length** section: `4`                                                                                                       | Length of the **Structure** section (`L` = `structure.len()`) | First value      |
+	/// | **Structure** section: `2, 1, -2, -0`                                                                                         | The **Structure** section                                     | Next `L` values  |
+	/// | **Data** section: `16533113728871998040, 3427872634365736244, 18115028555707261608, 15878401910454357952, 449479075714955186` | The **Data** section (layer IDs)                              | Remaining values |
 	///
 	/// The data section lists the layer IDs for all folders/layers in the tree as read from top to bottom.
 	/// The structure section lists signed numbers. The sign indicates a folder indentation change (`+` is down a level, `-` is up a level).
 	/// The numbers in the structure block encode the indentation. For example:
-	/// - `2` means read two element from the data section, then place a `[`.
+	/// - `2` means read two elements from the data section, then place a `[`.
 	/// - `-x` means read `x` elements from the data section and then insert a `]`.
 	///
 	/// ```text
@@ -1300,695 +1456,706 @@ impl DocumentMessageHandler {
 	/// [3427872634365736244,18115028555707261608,15878401910454357952]
 	/// [3427872634365736244,18115028555707261608,449479075714955186]
 	/// ```
-	pub fn serialize_root(&self) -> Vec<u64> {
-		let (mut structure, mut data) = (vec![0], Vec::new());
-		self.serialize_structure(self.graphene_document.root.as_folder().unwrap(), &mut structure, &mut data, &mut vec![]);
-		structure[0] = structure.len() as u64 - 1;
-		structure.extend(data);
+	pub fn serialize_root(&self) -> RawBuffer {
+		let mut structure_section = vec![NodeId(0).0];
+		let mut data_section = Vec::new();
+		self.serialize_structure(LayerNodeIdentifier::ROOT_PARENT, &mut structure_section, &mut data_section, &mut vec![]);
 
-		structure
+		// Remove the ROOT element. Prepend `L`, the length (excluding the ROOT) of the structure section (which happens to be where the ROOT element was).
+		structure_section[0] = structure_section.len() as u64 - 1;
+		// Append the data section to the end.
+		structure_section.extend(data_section);
+
+		structure_section.as_slice().into()
 	}
 
-	/// Returns an unsorted list of all layer paths including folders at all levels, except the document's top-level root folder itself
-	pub fn all_layers(&self) -> impl Iterator<Item = &[LayerId]> {
-		self.layer_metadata.keys().filter_map(|path| (!path.is_empty()).then_some(path.as_slice()))
-	}
-
-	/// Returns the paths to all layers in order
-	fn sort_layers<'a>(&self, paths: impl Iterator<Item = &'a [LayerId]>) -> Vec<&'a [LayerId]> {
-		// Compute the indices for each layer to be able to sort them
-		let mut layers_with_indices: Vec<(&[LayerId], Vec<usize>)> = paths
-			// 'path.len() > 0' filters out root layer since it has no indices
-			.filter_map(|path| (!path.is_empty()).then_some(path))
-			.filter_map(|path| {
-				// TODO: `indices_for_path` can return an error. We currently skip these layers and log a warning. Once this problem is solved this code can be simplified.
-				match self.graphene_document.indices_for_path(path) {
-					Err(err) => {
-						warn!("layers_sorted: Could not get indices for the layer {:?}: {:?}", path, err);
-						None
-					}
-					Ok(indices) => Some((path, indices)),
-				}
-			})
-			.collect();
-
-		layers_with_indices.sort_by_key(|(_, indices)| indices.clone());
-		layers_with_indices.into_iter().map(|(path, _)| path).collect()
-	}
-
-	/// Returns the paths to all layers in order
-	pub fn all_layers_sorted(&self) -> Vec<&[LayerId]> {
-		self.sort_layers(self.all_layers())
-	}
-
-	/// Returns the paths to all selected layers in order
-	pub fn selected_layers_sorted(&self) -> Vec<&[LayerId]> {
-		self.sort_layers(self.selected_layers())
-	}
-
-	/// Returns the paths to all non_selected layers in order
-	#[allow(dead_code)] // used for test cases
-	pub fn non_selected_layers_sorted(&self) -> Vec<&[LayerId]> {
-		self.sort_layers(self.non_selected_layers())
-	}
-
-	pub fn layer_metadata(&self, path: &[LayerId]) -> &LayerMetadata {
-		self.layer_metadata.get(path).unwrap_or_else(|| panic!("Editor's layer metadata for {:?} does not exist", path))
-	}
-
-	pub fn layer_metadata_mut(&mut self, path: &[LayerId]) -> &mut LayerMetadata {
-		Self::layer_metadata_mut_no_borrow_self(&mut self.layer_metadata, path)
-	}
-
-	pub fn layer_metadata_mut_no_borrow_self<'a>(layer_metadata: &'a mut HashMap<Vec<LayerId>, LayerMetadata>, path: &[LayerId]) -> &'a mut LayerMetadata {
-		layer_metadata
-			.get_mut(path)
-			.unwrap_or_else(|| panic!("Layer data cannot be found because the path {:?} does not exist", path))
-	}
-
-	pub fn backup(&mut self, responses: &mut VecDeque<Message>) {
+	/// Places a document into the history system
+	fn backup_with_document(&mut self, network: NodeNetwork, responses: &mut VecDeque<Message>) {
 		self.document_redo_history.clear();
-		self.document_undo_history.push_back((self.graphene_document.clone(), self.layer_metadata.clone()));
+		self.document_undo_history.push_back(network);
 		if self.document_undo_history.len() > crate::consts::MAX_UNDO_HISTORY_LEN {
 			self.document_undo_history.pop_front();
 		}
 
 		// Push the UpdateOpenDocumentsList message to the bus in order to update the save status of the open documents
-		responses.push_back(PortfolioMessage::UpdateOpenDocumentsList.into());
+		responses.add(PortfolioMessage::UpdateOpenDocumentsList);
 	}
 
-	pub fn rollback(&mut self, responses: &mut VecDeque<Message>) -> Result<(), EditorError> {
-		self.backup(responses);
-		self.undo(responses)
-		// TODO: Consider if we should check if the document is saved
+	/// Copies the entire document into the history system
+	pub fn backup(&mut self, responses: &mut VecDeque<Message>) {
+		self.backup_with_document(self.network.clone(), responses);
 	}
 
-	pub fn undo(&mut self, responses: &mut VecDeque<Message>) -> Result<(), EditorError> {
+	// TODO: Is this now redundant?
+	/// Push a message backing up the document in its current state
+	pub fn backup_nonmut(&self, responses: &mut VecDeque<Message>) {
+		responses.add(DocumentMessage::BackupDocument { network: self.network.clone() });
+	}
+
+	/// Replace the document with a new document save, returning the document save.
+	pub fn replace_document(&mut self, network: NodeNetwork) -> NodeNetwork {
+		std::mem::replace(&mut self.network, network)
+	}
+
+	pub fn undo_with_history(&mut self, responses: &mut VecDeque<Message>) {
+		let Some(previous_network) = self.undo(responses) else { return };
+
+		self.document_redo_history.push_back(previous_network);
+		if self.document_redo_history.len() > crate::consts::MAX_UNDO_HISTORY_LEN {
+			self.document_redo_history.pop_front();
+		}
+		// TODO: Find a better way to update click targets when undoing/redoing
+		if self.graph_view_overlay_open {
+			self.node_graph_handler.update_all_click_targets(&mut self.network, self.node_graph_handler.network.clone())
+		}
+	}
+	pub fn undo(&mut self, responses: &mut VecDeque<Message>) -> Option<NodeNetwork> {
 		// Push the UpdateOpenDocumentsList message to the bus in order to update the save status of the open documents
-		responses.push_back(PortfolioMessage::UpdateOpenDocumentsList.into());
+		responses.add(PortfolioMessage::UpdateOpenDocumentsList);
+		// If there is no history return and don't broadcast SelectionChanged
+		let Some(network) = self.document_undo_history.pop_back() else { return None };
 
-		let selected_paths: Vec<Vec<LayerId>> = self.selected_layers().map(|path| path.to_vec()).collect();
+		responses.add(BroadcastEvent::SelectionChanged);
 
-		match self.document_undo_history.pop_back() {
-			Some((document, layer_metadata)) => {
-				// Update the currently displayed layer on the Properties panel if the selection changes after an undo action
-				// Also appropriately update the Properties panel if an undo action results in a layer being deleted
-				let prev_selected_paths: Vec<Vec<LayerId>> = layer_metadata.iter().filter_map(|(layer_id, metadata)| metadata.selected.then_some(layer_id.clone())).collect();
+		let previous_network = std::mem::replace(&mut self.network, network);
+		Some(previous_network)
+	}
+	pub fn redo(&mut self, responses: &mut VecDeque<Message>) -> Option<NodeNetwork> {
+		// Push the UpdateOpenDocumentsList message to the bus in order to update the save status of the open documents
+		responses.add(PortfolioMessage::UpdateOpenDocumentsList);
+		// If there is no history return and don't broadcast SelectionChanged
+		let Some(network) = self.document_redo_history.pop_back() else { return None };
 
-				if prev_selected_paths != selected_paths {
-					responses.push_back(BroadcastEvent::SelectionChanged.into());
-				}
+		responses.add(BroadcastEvent::SelectionChanged);
 
-				let document = std::mem::replace(&mut self.graphene_document, document);
-				let layer_metadata = std::mem::replace(&mut self.layer_metadata, layer_metadata);
-				self.document_redo_history.push_back((document, layer_metadata));
-				if self.document_redo_history.len() > crate::consts::MAX_UNDO_HISTORY_LEN {
-					self.document_redo_history.pop_front();
-				}
+		let previous_network = std::mem::replace(&mut self.network, network);
+		Some(previous_network)
+	}
+	pub fn redo_with_history(&mut self, responses: &mut VecDeque<Message>) {
+		// Push the UpdateOpenDocumentsList message to the bus in order to update the save status of the open documents
+		let Some(previous_network) = self.redo(responses) else { return };
 
-				for layer in self.layer_metadata.keys() {
-					responses.push_back(DocumentMessage::LayerChanged { affected_layer_path: layer.clone() }.into())
-				}
-
-				Ok(())
-			}
-			None => Err(EditorError::NoTransactionInProgress),
+		self.document_undo_history.push_back(previous_network);
+		if self.document_undo_history.len() > crate::consts::MAX_UNDO_HISTORY_LEN {
+			self.document_undo_history.pop_front();
+		}
+		// TODO: Find a better way to update click targets when undoing/redoing
+		if self.graph_view_overlay_open {
+			self.node_graph_handler.update_all_click_targets(&mut self.network, self.node_graph_handler.network.clone())
 		}
 	}
 
-	pub fn redo(&mut self, responses: &mut VecDeque<Message>) -> Result<(), EditorError> {
-		// Push the UpdateOpenDocumentsList message to the bus in order to update the save status of the open documents
-		responses.push_back(PortfolioMessage::UpdateOpenDocumentsList.into());
-
-		let selected_paths: Vec<Vec<LayerId>> = self.selected_layers().map(|path| path.to_vec()).collect();
-
-		match self.document_redo_history.pop_back() {
-			Some((document, layer_metadata)) => {
-				// Update currently displayed layer on property panel if selection changes after redo action
-				// Also appropriately update property panel if redo action results in a layer being added
-				let next_selected_paths: Vec<Vec<LayerId>> = layer_metadata.iter().filter_map(|(layer_id, metadata)| metadata.selected.then_some(layer_id.clone())).collect();
-
-				if next_selected_paths != selected_paths {
-					responses.push_back(BroadcastEvent::SelectionChanged.into());
-				}
-
-				let document = std::mem::replace(&mut self.graphene_document, document);
-				let layer_metadata = std::mem::replace(&mut self.layer_metadata, layer_metadata);
-				self.document_undo_history.push_back((document, layer_metadata));
-				if self.document_undo_history.len() > crate::consts::MAX_UNDO_HISTORY_LEN {
-					self.document_undo_history.pop_front();
-				}
-
-				for layer in self.layer_metadata.keys() {
-					responses.push_back(DocumentMessage::LayerChanged { affected_layer_path: layer.clone() }.into())
-				}
-
-				Ok(())
-			}
-			None => Err(EditorError::NoTransactionInProgress),
-		}
-	}
-
-	pub fn current_identifier(&self) -> u64 {
-		// We can use the last state of the document to serve as the identifier to compare against
-		// This is useful since when the document is empty the identifier will be 0
-		self.document_undo_history
-			.iter()
-			.last()
-			.map(|(graphene_document, _)| graphene_document.current_state_identifier())
-			.unwrap_or(0)
+	pub fn current_hash(&self) -> Option<u64> {
+		self.document_undo_history.iter().last().map(|network| network.current_hash())
 	}
 
 	pub fn is_auto_saved(&self) -> bool {
-		self.current_identifier() == self.auto_saved_document_identifier
+		self.current_hash() == self.auto_saved_hash
 	}
 
 	pub fn is_saved(&self) -> bool {
-		self.current_identifier() == self.saved_document_identifier
+		self.current_hash() == self.saved_hash
+	}
+
+	pub fn is_graph_overlay_open(&self) -> bool {
+		self.graph_view_overlay_open
 	}
 
 	pub fn set_auto_save_state(&mut self, is_saved: bool) {
 		if is_saved {
-			self.auto_saved_document_identifier = self.current_identifier();
+			self.auto_saved_hash = self.current_hash();
 		} else {
-			self.auto_saved_document_identifier = generate_uuid();
+			self.auto_saved_hash = None;
 		}
 	}
 
 	pub fn set_save_state(&mut self, is_saved: bool) {
 		if is_saved {
-			self.saved_document_identifier = self.current_identifier();
+			self.saved_hash = self.current_hash();
 		} else {
-			self.saved_document_identifier = generate_uuid();
+			self.saved_hash = None;
 		}
 	}
 
-	// TODO: This should probably take a slice not a vec, also why does this even exist when `layer_panel_entry_from_path` also exists?
-	pub fn layer_panel_entry(&mut self, path: Vec<LayerId>, font_cache: &FontCache) -> Result<LayerPanelEntry, EditorError> {
-		let data: LayerMetadata = *self
-			.layer_metadata
-			.get_mut(&path)
-			.ok_or_else(|| EditorError::Document(format!("Could not get layer metadata for {:?}", path)))?;
-		let layer = self.graphene_document.layer(&path)?;
-		let entry = LayerPanelEntry::new(&data, self.graphene_document.multiply_transforms(&path)?, layer, path, font_cache);
-		Ok(entry)
+	pub fn get_downstream_node(network: &NodeNetwork, metadata: &DocumentMetadata, layer_to_move: LayerNodeIdentifier) -> Option<(NodeId, usize)> {
+		let mut downstream_layer = None;
+		if let Some(previous_sibling) = layer_to_move.previous_sibling(metadata) {
+			downstream_layer = Some((previous_sibling.to_node(), false))
+		} else if let Some(parent) = layer_to_move.parent(metadata) {
+			if parent != LayerNodeIdentifier::ROOT_PARENT {
+				downstream_layer = Some((parent.to_node(), true))
+			}
+		};
+
+		// Downstream layer should always exist
+		let Some((downstream_layer_node_id, downstream_layer_is_parent)) = downstream_layer else {
+			return None;
+		};
+
+		// Horizontal traversal if layer_to_move is the top of its layer stack, primary traversal if not
+		let flow_type = if downstream_layer_is_parent { FlowType::HorizontalFlow } else { FlowType::PrimaryFlow };
+
+		network
+			.upstream_flow_back_from_nodes(vec![downstream_layer_node_id], flow_type)
+			.find(|(node, node_id)| {
+				// Get secondary input only if it is the downstream_layer_node_id, the parent of layer to move, and a layer node (parent might be output)
+				let is_parent_layer = downstream_layer_is_parent && downstream_layer_node_id == *node_id && node.is_layer;
+				let node_input_index = if is_parent_layer { 1 } else { 0 };
+
+				node.inputs.get(node_input_index).is_some_and(|node_input| {
+					if let NodeInput::Node { node_id, .. } = node_input {
+						*node_id == layer_to_move.to_node()
+					} else {
+						false
+					}
+				})
+			})
+			.map(|(downstream_node, downstream_node_id)| {
+				let is_parent_layer = downstream_layer_is_parent && downstream_layer_node_id == downstream_node_id && downstream_node.is_layer;
+				let downstream_input_index = if is_parent_layer { 1 } else { 0 };
+
+				(downstream_node_id, downstream_input_index)
+			})
 	}
 
-	/// Returns a list of `LayerPanelEntry`s intended for display purposes. These don't contain
-	/// any actual data, but rather attributes such as visibility and names of the layers.
-	pub fn layer_panel(&mut self, path: &[LayerId], font_cache: &FontCache) -> Result<Vec<LayerPanelEntry>, EditorError> {
-		let folder = self.graphene_document.folder(path)?;
-		let paths: Vec<Vec<LayerId>> = folder.layer_ids.iter().map(|id| [path, &[*id]].concat()).collect();
-		let entries = paths.iter().rev().filter_map(|path| self.layer_panel_entry_from_path(path, font_cache)).collect();
-		Ok(entries)
+	/// Finds the parent folder which, based on the current selections, should be the container of any newly added layers.
+	pub fn new_layer_parent(&self, include_self: bool) -> LayerNodeIdentifier {
+		self.metadata()
+			.deepest_common_ancestor(self.selected_nodes.selected_layers(self.metadata()), include_self)
+			.unwrap_or_else(|| self.metadata().active_artboard())
 	}
 
-	pub fn layer_panel_entry_from_path(&self, path: &[LayerId], font_cache: &FontCache) -> Option<LayerPanelEntry> {
-		let layer_metadata = self.layer_metadata(path);
-		let transform = self
-			.graphene_document
-			.generate_transform_across_scope(path, Some(self.graphene_document.root.transform.inverse()))
-			.ok()?;
-		let layer = self.graphene_document.layer(path).ok()?;
+	pub fn get_calculated_insert_index(metadata: &DocumentMetadata, selected_nodes: &SelectedNodes, parent: LayerNodeIdentifier) -> isize {
+		parent
+			.children(metadata)
+			.enumerate()
+			.find_map(|(index, direct_child)| {
+				if selected_nodes.selected_layers(metadata).any(|selected| selected == direct_child) {
+					return Some(index as isize);
+				}
 
-		Some(LayerPanelEntry::new(layer_metadata, transform, layer, path.to_vec(), font_cache))
-	}
-
-	/// When working with an insert index, deleting the layers may cause the insert index to point to a different location (if the layer being deleted was located before the insert index).
-	///
-	/// This function updates the insert index so that it points to the same place after the specified `layers` are deleted.
-	fn update_insert_index<'a>(&self, layers: &[&'a [LayerId]], path: &[LayerId], insert_index: isize, reverse_index: bool) -> Result<isize, DocumentError> {
-		let folder = self.graphene_document.folder(path)?;
-		let insert_index = if reverse_index { folder.layer_ids.len() as isize - insert_index } else { insert_index };
-		let layer_ids_above = if insert_index < 0 { &folder.layer_ids } else { &folder.layer_ids[..(insert_index as usize)] };
-
-		Ok(insert_index - layer_ids_above.iter().filter(|layer_id| layers.iter().any(|x| *x == [path, &[**layer_id]].concat())).count() as isize)
-	}
-
-	/// Calculates the bounding box of all layers in the document
-	pub fn all_layer_bounds(&self, font_cache: &FontCache) -> Option<[DVec2; 2]> {
-		self.graphene_document.viewport_bounding_box(&[], font_cache).ok().flatten()
-	}
-
-	/// Calculates the document bounds used for scrolling and centring (the layer bounds or the artboard (if applicable))
-	pub fn document_bounds(&self, font_cache: &FontCache) -> Option<[DVec2; 2]> {
-		if self.artboard_message_handler.is_infinite_canvas() {
-			self.all_layer_bounds(font_cache)
-		} else {
-			self.artboard_message_handler.artboards_graphene_document.viewport_bounding_box(&[], font_cache).ok().flatten()
-		}
-	}
-
-	/// Calculate the path that new layers should be inserted to.
-	/// Depends on the selected layers as well as their types (Folder/Non-Folder)
-	pub fn get_path_for_new_layer(&self) -> Vec<u64> {
-		// If the selected layers don't actually exist, a new uuid for the
-		// root folder will be returned
-		let mut path = self.graphene_document.shallowest_common_folder(self.selected_layers()).map_or(vec![], |v| v.to_vec());
-		path.push(generate_uuid());
-		path
-	}
-
-	/// Loads layer resources such as creating the blob URLs for the images and loading all of the fonts in the document
-	pub fn load_layer_resources(&self, responses: &mut VecDeque<Message>, root: &LayerDataType, mut path: Vec<LayerId>, document_id: u64) {
-		fn walk_layers(data: &LayerDataType, path: &mut Vec<LayerId>, image_data: &mut Vec<FrontendImageData>, fonts: &mut HashSet<Font>) {
-			match data {
-				LayerDataType::Folder(folder) => {
-					for (id, layer) in folder.layer_ids.iter().zip(folder.layers().iter()) {
-						path.push(*id);
-						walk_layers(&layer.data, path, image_data, fonts);
-						path.pop();
+				for descendant in direct_child.descendants(metadata) {
+					if selected_nodes.selected_layers(metadata).any(|selected| selected == descendant) {
+						return Some(index as isize);
 					}
 				}
-				LayerDataType::Text(text) => {
-					fonts.insert(text.font.clone());
+
+				None
+			})
+			.unwrap_or(-1)
+	}
+
+	/// Loads layer resources such as creating the blob URLs for the images and loading all of the fonts in the document.
+	pub fn load_layer_resources(&self, responses: &mut VecDeque<Message>) {
+		let mut fonts = HashSet::new();
+		for (_node_id, node) in self.network.recursive_nodes() {
+			for input in &node.inputs {
+				if let NodeInput::Value {
+					tagged_value: TaggedValue::Font(font),
+					..
+				} = input
+				{
+					fonts.insert(font.clone());
 				}
-				LayerDataType::Image(image) => image_data.push(FrontendImageData {
-					path: path.clone(),
-					image_data: image.image_data.clone(),
-					mime: image.mime.clone(),
-				}),
-				LayerDataType::Imaginate(imaginate) => {
-					if let Some(data) = &imaginate.image_data {
-						image_data.push(FrontendImageData {
-							path: path.clone(),
-							image_data: data.image_data.clone(),
-							mime: imaginate.mime.clone(),
-						});
-					}
-				}
-				LayerDataType::NodeGraphFrame(node_graph_frame) => {
-					if let Some(data) = &node_graph_frame.image_data {
-						image_data.push(FrontendImageData {
-							path: path.clone(),
-							image_data: data.image_data.clone(),
-							mime: node_graph_frame.mime.clone(),
-						});
-					}
-				}
-				_ => {}
 			}
 		}
-
-		let mut image_data = Vec::new();
-		let mut fonts = HashSet::new();
-		walk_layers(root, &mut path, &mut image_data, &mut fonts);
-		if !image_data.is_empty() {
-			responses.push_front(FrontendMessage::UpdateImageData { document_id, image_data }.into());
-		}
 		for font in fonts {
-			responses.push_front(FrontendMessage::TriggerFontLoad { font, is_default: false }.into());
+			responses.add_front(FrontendMessage::TriggerFontLoad { font, is_default: false });
 		}
 	}
 
 	pub fn update_document_widgets(&self, responses: &mut VecDeque<Message>) {
-		let mut widgets = vec![
-			WidgetHolder::new(Widget::OptionalInput(OptionalInput {
-				checked: self.snapping_enabled,
-				icon: "Snapping".into(),
-				tooltip: "Snapping".into(),
-				on_update: WidgetCallback::new(|optional_input: &OptionalInput| DocumentMessage::SetSnapping { snap: optional_input.checked }.into()),
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::PopoverButton(PopoverButton {
-				header: "Snapping".into(),
-				text: "The contents of this popover menu are coming soon".into(),
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Unrelated,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::OptionalInput(OptionalInput {
-				checked: true,
-				icon: "Grid".into(),
-				tooltip: "Grid".into(),
-				on_update: WidgetCallback::new(|_| DialogMessage::RequestComingSoonDialog { issue: Some(318) }.into()),
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::PopoverButton(PopoverButton {
-				header: "Grid".into(),
-				text: "The contents of this popover menu are coming soon".into(),
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Unrelated,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::OptionalInput(OptionalInput {
-				checked: self.overlays_visible,
-				icon: "Overlays".into(),
-				tooltip: "Overlays".into(),
-				on_update: WidgetCallback::new(|optional_input: &OptionalInput| DocumentMessage::SetOverlaysVisibility { visible: optional_input.checked }.into()),
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::PopoverButton(PopoverButton {
-				header: "Overlays".into(),
-				text: "The contents of this popover menu are coming soon".into(),
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Unrelated,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::RadioInput(RadioInput {
-				selected_index: if self.view_mode == ViewMode::Normal { 0 } else { 1 },
-				entries: vec![
-					RadioEntryData {
-						value: "normal".into(),
-						icon: "ViewModeNormal".into(),
-						tooltip: "View Mode: Normal".into(),
-						on_update: WidgetCallback::new(|_| DocumentMessage::SetViewMode { view_mode: ViewMode::Normal }.into()),
-						..RadioEntryData::default()
-					},
-					RadioEntryData {
-						value: "outline".into(),
-						icon: "ViewModeOutline".into(),
-						tooltip: "View Mode: Outline".into(),
-						on_update: WidgetCallback::new(|_| DocumentMessage::SetViewMode { view_mode: ViewMode::Outline }.into()),
-						..RadioEntryData::default()
-					},
-					RadioEntryData {
-						value: "pixels".into(),
-						icon: "ViewModePixels".into(),
-						tooltip: "View Mode: Pixels".into(),
-						on_update: WidgetCallback::new(|_| DialogMessage::RequestComingSoonDialog { issue: Some(320) }.into()),
-						..RadioEntryData::default()
-					},
-				],
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::PopoverButton(PopoverButton {
-				header: "View Mode".into(),
-				text: "The contents of this popover menu are coming soon".into(),
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Section,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::IconButton(IconButton {
-				size: 24,
-				icon: "ZoomIn".into(),
-				tooltip: "Zoom In".into(),
-				tooltip_shortcut: action_keys!(NavigationMessageDiscriminant::IncreaseCanvasZoom),
-				on_update: WidgetCallback::new(|_| NavigationMessage::IncreaseCanvasZoom { center_on_mouse: false }.into()),
-				..IconButton::default()
-			})),
-			WidgetHolder::new(Widget::IconButton(IconButton {
-				size: 24,
-				icon: "ZoomOut".into(),
-				tooltip: "Zoom Out".into(),
-				tooltip_shortcut: action_keys!(NavigationMessageDiscriminant::DecreaseCanvasZoom),
-				on_update: WidgetCallback::new(|_| NavigationMessage::DecreaseCanvasZoom { center_on_mouse: false }.into()),
-				..IconButton::default()
-			})),
-			WidgetHolder::new(Widget::IconButton(IconButton {
-				size: 24,
-				icon: "ZoomReset".into(),
-				tooltip: "Zoom to 100%".into(),
-				tooltip_shortcut: action_keys!(DocumentMessageDiscriminant::ZoomCanvasTo100Percent),
-				on_update: WidgetCallback::new(|_| NavigationMessage::SetCanvasZoom { zoom_factor: 1. }.into()),
-				..IconButton::default()
-			})),
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Related,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::NumberInput(NumberInput {
-				unit: "%".into(),
-				value: Some(self.navigation_handler.snapped_scale() * 100.),
-				min: Some(0.000001),
-				max: Some(1000000.),
-				on_update: WidgetCallback::new(|number_input: &NumberInput| {
-					NavigationMessage::SetCanvasZoom {
-						zoom_factor: number_input.value.unwrap() / 100.,
-					}
-					.into()
-				}),
-				increment_behavior: NumberInputIncrementBehavior::Callback,
-				increment_callback_decrease: WidgetCallback::new(|_| NavigationMessage::DecreaseCanvasZoom { center_on_mouse: false }.into()),
-				increment_callback_increase: WidgetCallback::new(|_| NavigationMessage::IncreaseCanvasZoom { center_on_mouse: false }.into()),
-				..NumberInput::default()
-			})),
-		];
-		let rotation_value = self.navigation_handler.snapped_angle() / (std::f64::consts::PI / 180.);
-		if rotation_value.abs() > 0.00001 {
-			widgets.extend([
-				WidgetHolder::new(Widget::Separator(Separator {
-					separator_type: SeparatorType::Related,
-					direction: SeparatorDirection::Horizontal,
-				})),
-				WidgetHolder::new(Widget::NumberInput(NumberInput {
-					unit: "°".into(),
-					value: Some(rotation_value),
-					step: 15.,
-					on_update: WidgetCallback::new(|number_input: &NumberInput| {
-						NavigationMessage::SetCanvasRotation {
-							angle_radians: number_input.value.unwrap() * (std::f64::consts::PI / 180.),
-						}
-						.into()
-					}),
-					..NumberInput::default()
-				})),
-			]);
-		}
-		widgets.extend([
-			WidgetHolder::new(Widget::Separator(Separator {
-				separator_type: SeparatorType::Related,
-				direction: SeparatorDirection::Horizontal,
-			})),
-			WidgetHolder::new(Widget::PopoverButton(PopoverButton {
-				header: "Canvas Navigation".into(),
-				text: "Interactive options in this popover menu are coming soon.\nZoom with Shift + MMB Drag or Ctrl + Scroll Wheel Roll.\nRotate with Ctrl + MMB Drag.".into(),
-				..Default::default()
-			})),
-		]);
-		let document_bar_layout = WidgetLayout::new(vec![LayoutGroup::Row { widgets }]);
+		// Document mode (dropdown menu at the left of the bar above the viewport, before the tool options)
 
 		let document_mode_layout = WidgetLayout::new(vec![LayoutGroup::Row {
 			widgets: vec![
-				WidgetHolder::new(Widget::DropdownInput(DropdownInput {
-					entries: vec![vec![
-						DropdownEntryData {
-							label: DocumentMode::DesignMode.to_string(),
-							icon: DocumentMode::DesignMode.icon_name(),
-							..DropdownEntryData::default()
-						},
-						DropdownEntryData {
-							label: DocumentMode::SelectMode.to_string(),
-							icon: DocumentMode::SelectMode.icon_name(),
-							on_update: WidgetCallback::new(|_| DialogMessage::RequestComingSoonDialog { issue: Some(330) }.into()),
-							..DropdownEntryData::default()
-						},
-						DropdownEntryData {
-							label: DocumentMode::GuideMode.to_string(),
-							icon: DocumentMode::GuideMode.icon_name(),
-							on_update: WidgetCallback::new(|_| DialogMessage::RequestComingSoonDialog { issue: Some(331) }.into()),
-							..DropdownEntryData::default()
-						},
-					]],
-					selected_index: Some(self.document_mode as u32),
-					draw_icon: true,
-					interactive: false, // TODO: set to true when dialogs are not spawned
-					..Default::default()
-				})),
-				WidgetHolder::new(Widget::Separator(Separator {
-					separator_type: SeparatorType::Section,
-					direction: SeparatorDirection::Horizontal,
-				})),
+				DropdownInput::new(
+					vec![vec![
+						MenuListEntry::new(format!("{:?}", DocumentMode::DesignMode))
+							.label(DocumentMode::DesignMode.to_string())
+							.icon(DocumentMode::DesignMode.icon_name()),
+						MenuListEntry::new(format!("{:?}", DocumentMode::SelectMode))
+							.label(DocumentMode::SelectMode.to_string())
+							.icon(DocumentMode::SelectMode.icon_name())
+							.on_commit(|_| DialogMessage::RequestComingSoonDialog { issue: Some(330) }.into()),
+						MenuListEntry::new(format!("{:?}", DocumentMode::GuideMode))
+							.label(DocumentMode::GuideMode.to_string())
+							.icon(DocumentMode::GuideMode.icon_name())
+							.on_commit(|_| DialogMessage::RequestComingSoonDialog { issue: Some(331) }.into()),
+					]])
+					.selected_index(Some(self.document_mode as u32))
+					.draw_icon(true)
+					.interactive(false) // TODO: set to true when dialogs are not spawned
+					.widget_holder(),
+				Separator::new(SeparatorType::Section).widget_holder(),
 			],
 		}]);
 
-		responses.push_back(
-			LayoutMessage::SendLayout {
-				layout: Layout::WidgetLayout(document_bar_layout),
-				layout_target: LayoutTarget::DocumentBar,
-			}
-			.into(),
-		);
+		responses.add(LayoutMessage::SendLayout {
+			layout: Layout::WidgetLayout(document_mode_layout),
+			layout_target: LayoutTarget::DocumentMode,
+		});
 
-		responses.push_back(
-			LayoutMessage::SendLayout {
-				layout: Layout::WidgetLayout(document_mode_layout),
-				layout_target: LayoutTarget::DocumentMode,
-			}
-			.into(),
-		);
+		// Document bar (right portion of the bar above the viewport)
+
+		let snapping_state = self.snapping_state.clone();
+
+		let mut widgets = vec![
+			CheckboxInput::new(self.overlays_visible)
+				.icon("Overlays")
+				.tooltip("Overlays")
+				.tooltip_shortcut(action_keys!(DocumentMessageDiscriminant::ToggleOverlaysVisibility))
+				.on_update(|optional_input: &CheckboxInput| DocumentMessage::SetOverlaysVisibility { visible: optional_input.checked }.into())
+				.widget_holder(),
+			PopoverButton::new()
+				.popover_layout(vec![
+					LayoutGroup::Row {
+						widgets: vec![TextLabel::new("Overlays").bold(true).widget_holder()],
+					},
+					LayoutGroup::Row {
+						widgets: vec![TextLabel::new("Coming soon").widget_holder()],
+					},
+				])
+				.widget_holder(),
+			Separator::new(SeparatorType::Related).widget_holder(),
+			CheckboxInput::new(snapping_state.snapping_enabled)
+				.icon("Snapping")
+				.tooltip("Snapping")
+				.tooltip_shortcut(action_keys!(DocumentMessageDiscriminant::ToggleSnapping))
+				.on_update(move |optional_input: &CheckboxInput| {
+					let snapping_enabled = optional_input.checked;
+					DocumentMessage::SetSnapping {
+						snapping_enabled: Some(snapping_enabled),
+						bounding_box_snapping: None,
+						geometry_snapping: None,
+					}
+					.into()
+				})
+				.widget_holder(),
+			PopoverButton::new()
+				.popover_layout(
+					[
+						LayoutGroup::Row {
+							widgets: vec![TextLabel::new("Snapping").bold(true).widget_holder()],
+						},
+						LayoutGroup::Row {
+							widgets: vec![TextLabel::new(SnappingOptions::BoundingBoxes.to_string()).widget_holder()],
+						},
+					]
+					.into_iter()
+					.chain(
+						[
+							(BoundingBoxSnapTarget::Center, snapping_state.bounds.centers),
+							(BoundingBoxSnapTarget::Corner, snapping_state.bounds.corners),
+							(BoundingBoxSnapTarget::Edge, snapping_state.bounds.edges),
+							(BoundingBoxSnapTarget::EdgeMidpoint, snapping_state.bounds.edge_midpoints),
+						]
+						.into_iter()
+						.map(|(enum_type, bound_state)| LayoutGroup::Row {
+							widgets: vec![
+								CheckboxInput::new(bound_state)
+									.on_update(move |input: &CheckboxInput| {
+										DocumentMessage::SetSnapping {
+											snapping_enabled: None,
+											bounding_box_snapping: Some(OptionBoundsSnapping {
+												edges: if enum_type == BoundingBoxSnapTarget::Edge { Some(input.checked) } else { None },
+												edge_midpoints: if enum_type == BoundingBoxSnapTarget::EdgeMidpoint { Some(input.checked) } else { None },
+												centers: if enum_type == BoundingBoxSnapTarget::Center { Some(input.checked) } else { None },
+												corners: if enum_type == BoundingBoxSnapTarget::Corner { Some(input.checked) } else { None },
+											}),
+											geometry_snapping: None,
+										}
+										.into()
+									})
+									.widget_holder(),
+								TextLabel::new(enum_type.to_string()).widget_holder(),
+							],
+						})
+						.chain(
+							[
+								LayoutGroup::Row {
+									widgets: vec![TextLabel::new(SnappingOptions::Geometry.to_string()).widget_holder()],
+								},
+								LayoutGroup::Row {
+									widgets: vec![
+										CheckboxInput::new(snapping_state.nodes.anchors)
+											.on_update(move |input: &CheckboxInput| {
+												DocumentMessage::SetSnapping {
+													snapping_enabled: None,
+													bounding_box_snapping: None,
+													geometry_snapping: Some(OptionPointSnapping {
+														anchors: Some(input.checked),
+														..Default::default()
+													}),
+												}
+												.into()
+											})
+											.widget_holder(),
+										TextLabel::new("Anchor").widget_holder(),
+									],
+								},
+							]
+							.into_iter()
+							.chain(
+								[
+									(GeometrySnapTarget::LineMidpoint, snapping_state.nodes.line_midpoints),
+									(GeometrySnapTarget::Path, snapping_state.nodes.paths),
+									(GeometrySnapTarget::Normal, snapping_state.nodes.normals),
+									(GeometrySnapTarget::Tangent, snapping_state.nodes.tangents),
+									(GeometrySnapTarget::Intersection, snapping_state.nodes.path_intersections),
+								]
+								.into_iter()
+								.map(|(enum_type, bound_state)| LayoutGroup::Row {
+									widgets: vec![
+										CheckboxInput::new(bound_state)
+											.on_update(move |input: &CheckboxInput| {
+												DocumentMessage::SetSnapping {
+													snapping_enabled: None,
+													bounding_box_snapping: None,
+													geometry_snapping: Some(OptionPointSnapping {
+														anchors: None,
+														line_midpoints: if enum_type == GeometrySnapTarget::LineMidpoint { Some(input.checked) } else { None },
+														paths: if enum_type == GeometrySnapTarget::Path { Some(input.checked) } else { None },
+														normals: if enum_type == GeometrySnapTarget::Normal { Some(input.checked) } else { None },
+														tangents: if enum_type == GeometrySnapTarget::Tangent { Some(input.checked) } else { None },
+														path_intersections: if enum_type == GeometrySnapTarget::Intersection { Some(input.checked) } else { None },
+													}),
+												}
+												.into()
+											})
+											.widget_holder(),
+										TextLabel::new(enum_type.to_string()).widget_holder(),
+									],
+								}),
+							),
+						),
+					)
+					.collect(),
+				)
+				.widget_holder(),
+			Separator::new(SeparatorType::Related).widget_holder(),
+			CheckboxInput::new(self.snapping_state.grid_snapping)
+				.icon("Grid")
+				.tooltip("Grid")
+				.tooltip_shortcut(action_keys!(DocumentMessageDiscriminant::ToggleGridVisibility))
+				.on_update(|optional_input: &CheckboxInput| DocumentMessage::GridVisibility(optional_input.checked).into())
+				.widget_holder(),
+			PopoverButton::new()
+				.popover_layout(overlay_options(&self.snapping_state.grid))
+				.popover_min_width(Some(320))
+				.widget_holder(),
+			Separator::new(SeparatorType::Unrelated).widget_holder(),
+			RadioInput::new(vec![
+				RadioEntryData::new("normal")
+					.icon("ViewModeNormal")
+					.tooltip("View Mode: Normal")
+					.on_update(|_| DocumentMessage::SetViewMode { view_mode: ViewMode::Normal }.into()),
+				RadioEntryData::new("outline")
+					.icon("ViewModeOutline")
+					.tooltip("View Mode: Outline")
+					.on_update(|_| DocumentMessage::SetViewMode { view_mode: ViewMode::Outline }.into()),
+				RadioEntryData::new("pixels")
+					.icon("ViewModePixels")
+					.tooltip("View Mode: Pixels")
+					.on_update(|_| DialogMessage::RequestComingSoonDialog { issue: Some(320) }.into()),
+			])
+			.selected_index(match self.view_mode {
+				ViewMode::Normal => Some(0),
+				_ => Some(1),
+			})
+			.widget_holder(),
+			PopoverButton::new()
+				.popover_layout(vec![
+					LayoutGroup::Row {
+						widgets: vec![TextLabel::new("View Mode").bold(true).widget_holder()],
+					},
+					LayoutGroup::Row {
+						widgets: vec![TextLabel::new("Coming soon").widget_holder()],
+					},
+				])
+				.widget_holder(),
+			Separator::new(SeparatorType::Unrelated).widget_holder(),
+			IconButton::new("ZoomIn", 24)
+				.tooltip("Zoom In")
+				.tooltip_shortcut(action_keys!(NavigationMessageDiscriminant::CanvasZoomIncrease))
+				.on_update(|_| NavigationMessage::CanvasZoomIncrease { center_on_mouse: false }.into())
+				.widget_holder(),
+			IconButton::new("ZoomOut", 24)
+				.tooltip("Zoom Out")
+				.tooltip_shortcut(action_keys!(NavigationMessageDiscriminant::CanvasZoomDecrease))
+				.on_update(|_| NavigationMessage::CanvasZoomDecrease { center_on_mouse: false }.into())
+				.widget_holder(),
+			IconButton::new("ZoomReset", 24)
+				.tooltip("Reset Tilt and Zoom to 100%")
+				.tooltip_shortcut(action_keys!(NavigationMessageDiscriminant::CanvasTiltResetAndZoomTo100Percent))
+				.on_update(|_| NavigationMessage::CanvasTiltResetAndZoomTo100Percent.into())
+				.disabled(self.navigation.tilt.abs() < 1e-4 && (self.navigation.zoom - 1.).abs() < 1e-4)
+				.widget_holder(),
+			PopoverButton::new()
+				.popover_layout(vec![
+					LayoutGroup::Row {
+						widgets: vec![TextLabel::new("Canvas Navigation").bold(true).widget_holder()],
+					},
+					LayoutGroup::Row {
+						widgets: vec![TextLabel::new(
+							"
+								Interactive controls in this\n\
+								menu are coming soon.\n\
+								\n\
+								Pan:\n\
+								• Middle Click Drag\n\
+								\n\
+								Tilt:\n\
+								• Alt + Middle Click Drag\n\
+								\n\
+								Zoom:\n\
+								• Shift + Middle Click Drag\n\
+								• Ctrl + Scroll Wheel Roll
+							"
+							.trim(),
+						)
+						.multiline(true)
+						.widget_holder()],
+					},
+				])
+				.widget_holder(),
+			Separator::new(SeparatorType::Related).widget_holder(),
+			NumberInput::new(Some(self.navigation_handler.snapped_zoom(self.navigation.zoom) * 100.))
+				.unit("%")
+				.min(0.000001)
+				.max(1000000.)
+				.tooltip("Document zoom within the viewport")
+				.on_update(|number_input: &NumberInput| {
+					NavigationMessage::CanvasZoomSet {
+						zoom_factor: number_input.value.unwrap() / 100.,
+					}
+					.into()
+				})
+				.increment_behavior(NumberInputIncrementBehavior::Callback)
+				.increment_callback_decrease(|_| NavigationMessage::CanvasZoomDecrease { center_on_mouse: false }.into())
+				.increment_callback_increase(|_| NavigationMessage::CanvasZoomIncrease { center_on_mouse: false }.into())
+				.widget_holder(),
+		];
+
+		let tilt_value = self.navigation_handler.snapped_tilt(self.navigation.tilt) / (std::f64::consts::PI / 180.);
+		if tilt_value.abs() > 0.00001 {
+			widgets.extend([
+				Separator::new(SeparatorType::Related).widget_holder(),
+				NumberInput::new(Some(tilt_value))
+					.unit("°")
+					.increment_behavior(NumberInputIncrementBehavior::Callback)
+					.increment_callback_increase(|number_input: &NumberInput| {
+						let one = 1. + f64::EPSILON * 100.;
+						NavigationMessage::CanvasTiltSet {
+							angle_radians: ((number_input.value.unwrap() / VIEWPORT_ROTATE_SNAP_INTERVAL + one).floor() * VIEWPORT_ROTATE_SNAP_INTERVAL).to_radians(),
+						}
+						.into()
+					})
+					.increment_callback_decrease(|number_input: &NumberInput| {
+						let one = 1. + f64::EPSILON * 100.;
+						NavigationMessage::CanvasTiltSet {
+							angle_radians: ((number_input.value.unwrap() / VIEWPORT_ROTATE_SNAP_INTERVAL - one).ceil() * VIEWPORT_ROTATE_SNAP_INTERVAL).to_radians(),
+						}
+						.into()
+					})
+					.tooltip("Document tilt within the viewport")
+					.on_update(|number_input: &NumberInput| {
+						NavigationMessage::CanvasTiltSet {
+							angle_radians: number_input.value.unwrap().to_radians(),
+						}
+						.into()
+					})
+					.widget_holder(),
+			]);
+		}
+
+		widgets.extend([
+			Separator::new(SeparatorType::Unrelated).widget_holder(),
+			TextButton::new("Node Graph")
+				.icon(Some((if self.graph_view_overlay_open { "GraphViewOpen" } else { "GraphViewClosed" }).into()))
+				.hover_icon(Some((if self.graph_view_overlay_open { "GraphViewClosed" } else { "GraphViewOpen" }).into()))
+				.tooltip(if self.graph_view_overlay_open { "Hide Node Graph" } else { "Show Node Graph" })
+				.tooltip_shortcut(action_keys!(DocumentMessageDiscriminant::GraphViewOverlayToggle))
+				.on_update(move |_| DocumentMessage::GraphViewOverlayToggle.into())
+				.widget_holder(),
+		]);
+
+		let document_bar_layout = WidgetLayout::new(vec![LayoutGroup::Row { widgets }]);
+
+		responses.add(LayoutMessage::SendLayout {
+			layout: Layout::WidgetLayout(document_bar_layout),
+			layout_target: LayoutTarget::DocumentBar,
+		});
 	}
 
-	pub fn update_layer_tree_options_bar_widgets(&self, responses: &mut VecDeque<Message>, font_cache: &FontCache) {
-		let mut opacity = None;
-		let mut opacity_is_mixed = false;
+	pub fn update_layers_panel_options_bar_widgets(&self, responses: &mut VecDeque<Message>) {
+		// Get an iterator over the selected layers (excluding artboards which don't have an opacity or blend mode).
+		let selected_layers_except_artboards = self.selected_nodes.selected_layers_except_artboards(self.metadata());
 
-		let mut blend_mode = None;
-		let mut blend_mode_is_mixed = false;
+		// Look up the current opacity and blend mode of the selected layers (if any), and split the iterator into the first tuple and the rest.
+		let mut opacity_and_blend_mode = selected_layers_except_artboards.map(|layer| (get_opacity(layer, &self.network).unwrap_or(100.), get_blend_mode(layer, &self.network).unwrap_or_default()));
+		let first_opacity_and_blend_mode = opacity_and_blend_mode.next();
+		let result_opacity_and_blend_mode = opacity_and_blend_mode;
 
-		self.layer_metadata
-			.keys()
-			.filter_map(|path| self.layer_panel_entry_from_path(path, font_cache))
-			.filter(|layer_panel_entry| layer_panel_entry.layer_metadata.selected)
-			.flat_map(|layer_panel_entry| self.graphene_document.layer(layer_panel_entry.path.as_slice()))
-			.for_each(|layer| {
-				match opacity {
-					None => opacity = Some(layer.opacity),
-					Some(opacity) => {
-						if (opacity - layer.opacity).abs() > (1. / 1_000_000.) {
-							opacity_is_mixed = true;
-						}
+		// If there are no selected layers, disable the opacity and blend mode widgets.
+		let disabled = first_opacity_and_blend_mode.is_none();
+
+		// Amongst the selected layers, check if the opacities and blend modes are identical across all layers.
+		// The result is setting `option` and `blend_mode` to Some value if all their values are identical, or None if they are not.
+		// If identical, we display the value in the widget. If not, we display a dash indicating dissimilarity.
+		let (opacity, blend_mode) = first_opacity_and_blend_mode
+			.map(|(first_opacity, first_blend_mode)| {
+				let mut opacity_identical = true;
+				let mut blend_mode_identical = true;
+
+				for (opacity, blend_mode) in result_opacity_and_blend_mode {
+					if (opacity - first_opacity).abs() > (f64::EPSILON * 100.) {
+						opacity_identical = false;
+					}
+					if blend_mode != first_blend_mode {
+						blend_mode_identical = false;
 					}
 				}
 
-				match blend_mode {
-					None => blend_mode = Some(layer.blend_mode),
-					Some(blend_mode) => {
-						if blend_mode != layer.blend_mode {
-							blend_mode_is_mixed = true;
-						}
-					}
-				}
-			});
+				(opacity_identical.then_some(first_opacity), blend_mode_identical.then_some(first_blend_mode))
+			})
+			.unwrap_or((None, None));
 
-		if opacity_is_mixed {
-			opacity = None;
-		}
-		if blend_mode_is_mixed {
-			blend_mode = None;
-		}
-
-		let blend_mode_menu_entries = BlendMode::list_modes_in_groups()
+		let blend_mode_menu_entries = BlendMode::list_svg_subset()
 			.iter()
 			.map(|modes| {
 				modes
 					.iter()
-					.map(|mode| DropdownEntryData {
-						label: mode.to_string(),
-						value: mode.to_string(),
-						on_update: WidgetCallback::new(|_| DocumentMessage::SetBlendModeForSelectedLayers { blend_mode: *mode }.into()),
-						..Default::default()
+					.map(|&blend_mode| {
+						MenuListEntry::new(format!("{blend_mode:?}"))
+							.label(blend_mode.to_string())
+							.on_update(move |_| DocumentMessage::SetBlendModeForSelectedLayers { blend_mode }.into())
+							.on_commit(|_| DocumentMessage::StartTransaction.into())
 					})
 					.collect()
 			})
 			.collect();
 
-		let layer_tree_options = WidgetLayout::new(vec![LayoutGroup::Row {
+		let has_selection = self.selected_nodes.selected_layers(self.metadata()).next().is_some();
+		let selection_all_visible = self.selected_nodes.selected_layers(self.metadata()).all(|layer| self.metadata().node_is_visible(layer.to_node()));
+		let selection_all_locked = self.selected_nodes.selected_layers(self.metadata()).all(|layer| self.metadata().node_is_locked(layer.to_node()));
+
+		let layers_panel_options_bar = WidgetLayout::new(vec![LayoutGroup::Row {
 			widgets: vec![
-				WidgetHolder::new(Widget::DropdownInput(DropdownInput {
-					entries: blend_mode_menu_entries,
-					selected_index: blend_mode.map(|blend_mode| blend_mode as u32),
-					disabled: blend_mode.is_none() && !blend_mode_is_mixed,
-					draw_icon: false,
-					..Default::default()
-				})),
-				WidgetHolder::new(Widget::Separator(Separator {
-					separator_type: SeparatorType::Related,
-					direction: SeparatorDirection::Horizontal,
-				})),
-				WidgetHolder::new(Widget::NumberInput(NumberInput {
-					label: "Opacity".into(),
-					unit: "%".into(),
-					display_decimal_places: 2,
-					disabled: opacity.is_none() && !opacity_is_mixed,
-					value: opacity.map(|opacity| opacity * 100.),
-					min: Some(0.),
-					max: Some(100.),
-					range_min: Some(0.),
-					range_max: Some(100.),
-					mode: NumberInputMode::Range,
-					on_update: WidgetCallback::new(|number_input: &NumberInput| {
+				DropdownInput::new(blend_mode_menu_entries)
+					.selected_index(blend_mode.and_then(|blend_mode| blend_mode.index_in_list_svg_subset()).map(|index| index as u32))
+					.disabled(disabled)
+					.draw_icon(false)
+					.widget_holder(),
+				Separator::new(SeparatorType::Related).widget_holder(),
+				NumberInput::new(opacity)
+					.label("Opacity")
+					.unit("%")
+					.display_decimal_places(2)
+					.disabled(disabled)
+					.min(0.)
+					.max(100.)
+					.range_min(Some(0.))
+					.range_max(Some(100.))
+					.mode_range()
+					.on_update(|number_input: &NumberInput| {
 						if let Some(value) = number_input.value {
 							DocumentMessage::SetOpacityForSelectedLayers { opacity: value / 100. }.into()
 						} else {
 							Message::NoOp
 						}
-					}),
-					..NumberInput::default()
-				})),
-				WidgetHolder::new(Widget::Separator(Separator {
-					separator_type: SeparatorType::Section,
-					direction: SeparatorDirection::Horizontal,
-				})),
-				WidgetHolder::new(Widget::IconButton(IconButton {
-					icon: "NodeFolder".into(),
-					tooltip: "New Folder".into(),
-					tooltip_shortcut: action_keys!(DocumentMessageDiscriminant::CreateEmptyFolder),
-					size: 24,
-					on_update: WidgetCallback::new(|_| DocumentMessage::CreateEmptyFolder { container_path: vec![] }.into()),
-					..Default::default()
-				})),
-				WidgetHolder::new(Widget::IconButton(IconButton {
-					icon: "Trash".into(),
-					tooltip: "Delete Selected".into(),
-					tooltip_shortcut: action_keys!(DocumentMessageDiscriminant::DeleteSelectedLayers),
-					size: 24,
-					on_update: WidgetCallback::new(|_| DocumentMessage::DeleteSelectedLayers.into()),
-					..Default::default()
-				})),
+					})
+					.widget_holder(),
+				//
+				Separator::new(SeparatorType::Unrelated).widget_holder(),
+				//
+				IconButton::new("NewLayer", 24)
+					.tooltip("New Layer")
+					.tooltip_shortcut(action_keys!(DocumentMessageDiscriminant::CreateEmptyFolder))
+					.on_update(|_| DocumentMessage::CreateEmptyFolder.into())
+					.widget_holder(),
+				IconButton::new("Folder", 24)
+					.tooltip("Group Selected")
+					.tooltip_shortcut(action_keys!(DocumentMessageDiscriminant::GroupSelectedLayers))
+					.on_update(|_| DocumentMessage::GroupSelectedLayers.into())
+					.disabled(!has_selection)
+					.widget_holder(),
+				IconButton::new("Trash", 24)
+					.tooltip("Delete Selected")
+					.tooltip_shortcut(action_keys!(DocumentMessageDiscriminant::DeleteSelectedLayers))
+					.on_update(|_| DocumentMessage::DeleteSelectedLayers.into())
+					.disabled(!has_selection)
+					.widget_holder(),
+				//
+				Separator::new(SeparatorType::Unrelated).widget_holder(),
+				//
+				IconButton::new(if selection_all_locked { "PadlockLocked" } else { "PadlockUnlocked" }, 24)
+					.hover_icon(Some((if selection_all_locked { "PadlockUnlocked" } else { "PadlockLocked" }).into()))
+					.tooltip(if selection_all_locked { "Unlock Selected" } else { "Lock Selected" })
+					.tooltip_shortcut(action_keys!(GraphOperationMessageDiscriminant::ToggleSelectedLocked))
+					.on_update(|_| GraphOperationMessage::ToggleSelectedLocked.into())
+					.disabled(!has_selection)
+					.widget_holder(),
+				IconButton::new(if selection_all_visible { "EyeVisible" } else { "EyeHidden" }, 24)
+					.hover_icon(Some((if selection_all_visible { "EyeHide" } else { "EyeShow" }).into()))
+					.tooltip(if selection_all_visible { "Hide Selected" } else { "Show Selected" })
+					.tooltip_shortcut(action_keys!(GraphOperationMessageDiscriminant::ToggleSelectedVisibility))
+					.on_update(|_| GraphOperationMessage::ToggleSelectedVisibility.into())
+					.disabled(!has_selection)
+					.widget_holder(),
 			],
 		}]);
 
-		responses.push_back(
-			LayoutMessage::SendLayout {
-				layout: Layout::WidgetLayout(layer_tree_options),
-				layout_target: LayoutTarget::LayerTreeOptions,
-			}
-			.into(),
-		);
+		responses.add(LayoutMessage::SendLayout {
+			layout: Layout::WidgetLayout(layers_panel_options_bar),
+			layout_target: LayoutTarget::LayersPanelOptions,
+		});
 	}
 
 	pub fn selected_layers_reorder(&mut self, relative_index_offset: isize, responses: &mut VecDeque<Message>) {
 		self.backup(responses);
 
-		let all_layer_paths = self.all_layers_sorted();
-		let selected_layers = self.selected_layers_sorted();
+		let mut selected_layers = self.selected_nodes.selected_layers(self.metadata());
 
 		let first_or_last_selected_layer = match relative_index_offset.signum() {
-			-1 => selected_layers.first(),
+			-1 => selected_layers.next(),
 			1 => selected_layers.last(),
 			_ => panic!("selected_layers_reorder() must be given a non-zero value"),
 		};
 
-		if let Some(pivot_layer) = first_or_last_selected_layer {
-			let sibling_layer_paths: Vec<_> = all_layer_paths
-				.iter()
-				.filter(|layer| {
-					// Check if this is a sibling of the pivot layer
-					// TODO: Break this out into a reusable function `fn are_layers_siblings(layer_a, layer_b) -> bool`
-					let containing_folder_path = &pivot_layer[0..pivot_layer.len() - 1];
-					layer.starts_with(containing_folder_path) && pivot_layer.len() == layer.len()
-				})
-				.collect();
+		let Some(pivot_layer) = first_or_last_selected_layer else {
+			return;
+		};
+		let parent = pivot_layer.parent(self.metadata()).unwrap_or(LayerNodeIdentifier::ROOT_PARENT);
 
-			// TODO: Break this out into a reusable function: `fn layer_index_in_containing_folder(layer_path) -> usize`
-			let pivot_index_among_siblings = sibling_layer_paths.iter().position(|path| *path == pivot_layer);
+		let sibling_layer_paths: Vec<_> = parent.children(self.metadata()).collect();
+		let Some(pivot_index) = sibling_layer_paths.iter().position(|path| *path == pivot_layer) else {
+			return;
+		};
 
-			if let Some(pivot_index) = pivot_index_among_siblings {
-				let max = sibling_layer_paths.len() as i64 - 1;
-				let insert_index = (pivot_index as i64 + relative_index_offset as i64).clamp(0, max) as usize;
+		let max = sibling_layer_paths.len() as i64 - 1;
+		let insert_index = (pivot_index as i64 + relative_index_offset as i64).clamp(0, max) as usize;
 
-				let existing_layer_to_insert_beside = sibling_layer_paths.get(insert_index);
+		let Some(&neighbor) = sibling_layer_paths.get(insert_index) else {
+			return;
+		};
+		let Some(neighbor_index) = sibling_layer_paths.iter().position(|path| *path == neighbor) else {
+			return;
+		};
 
-				// TODO: Break this block out into a call to a message called `MoveSelectedLayersNextToLayer { neighbor_path, above_or_below }`
-				if let Some(neighbor_path) = existing_layer_to_insert_beside {
-					let (neighbor_id, folder_path) = neighbor_path.split_last().expect("Can't move the root folder");
+		// If moving down, insert below this layer. If moving up, insert above this layer.
+		let insert_index = if relative_index_offset < 0 { neighbor_index } else { neighbor_index + 1 } as isize;
+		responses.add(DocumentMessage::MoveSelectedLayersTo { parent, insert_index });
+	}
+}
 
-					if let Some(folder) = self.graphene_document.layer(folder_path).ok().and_then(|layer| layer.as_folder().ok()) {
-						let neighbor_layer_index = folder.layer_ids.iter().position(|id| id == neighbor_id).unwrap() as isize;
-
-						// If moving down, insert below this layer. If moving up, insert above this layer.
-						let insert_index = if relative_index_offset < 0 { neighbor_layer_index } else { neighbor_layer_index + 1 };
-
-						responses.push_back(
-							DocumentMessage::MoveSelectedLayersTo {
-								folder_path: folder_path.to_vec(),
-								insert_index,
-								reverse_index: false,
-							}
-							.into(),
-						);
-					}
-				}
-			}
-		}
+fn root_network() -> NodeNetwork {
+	{
+		let mut network = NodeNetwork::default();
+		network.exports = vec![NodeInput::Value {
+			tagged_value: TaggedValue::ArtboardGroup(graphene_core::ArtboardGroup::EMPTY),
+			exposed: true,
+		}];
+		network
 	}
 }

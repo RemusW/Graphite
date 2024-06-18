@@ -7,8 +7,8 @@ fn parse_hint_helper_attrs(attrs: &[Attribute]) -> syn::Result<(Vec<LitStr>, Vec
 	fold_error_iter(
 		attrs
 			.iter()
-			.filter(|a| a.path.get_ident().map_or(false, |i| i == "hint"))
-			.map(|attr| syn::parse2::<AttrInnerKeyStringMap>(attr.tokens.clone())),
+			.filter(|a| a.path().get_ident().map_or(false, |i| i == "hint"))
+			.map(|attr| attr.parse_args::<AttrInnerKeyStringMap>()),
 	)
 	.and_then(|v: Vec<AttrInnerKeyStringMap>| {
 		fold_error_iter(AttrInnerKeyStringMap::multi_into_iter(v).map(|(k, mut v)| match v.len() {
@@ -21,7 +21,7 @@ fn parse_hint_helper_attrs(attrs: &[Attribute]) -> syn::Result<(Vec<LitStr>, Vec
 				// the first value is ok, the other ones should error
 				let after_first = v.into_iter().skip(1);
 				// this call to fold_error_iter will always return Err with a combined error
-				fold_error_iter(after_first.map(|lit| Err(syn::Error::new(lit.span(), format!("value for key {} was already given", k))))).map(|_: Vec<()>| unreachable!())
+				fold_error_iter(after_first.map(|lit| Err(syn::Error::new(lit.span(), format!("value for key {k} was already given"))))).map(|_: Vec<()>| unreachable!())
 			}
 		}))
 	})

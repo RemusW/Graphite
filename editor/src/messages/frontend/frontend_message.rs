@@ -1,33 +1,26 @@
-use super::utility_types::{FrontendDocumentDetails, FrontendImageData, MouseCursorIcon};
-use crate::messages::layout::utility_types::layout_widget::SubLayout;
-use crate::messages::layout::utility_types::misc::LayoutTarget;
-use crate::messages::layout::utility_types::widgets::menu_widgets::MenuBarEntry;
-use crate::messages::portfolio::document::node_graph::{FrontendNode, FrontendNodeLink, FrontendNodeType};
-use crate::messages::portfolio::document::utility_types::layer_panel::{LayerPanelEntry, RawBuffer};
+use super::utility_types::{FrontendDocumentDetails, MouseCursorIcon};
+use crate::messages::layout::utility_types::widget_prelude::*;
+use crate::messages::portfolio::document::node_graph::utility_types::{BoxSelection, ContextMenuInformation, FrontendNode, FrontendNodeType, FrontendNodeWire, Transform, WirePath};
+use crate::messages::portfolio::document::utility_types::nodes::{JsRawBuffer, LayerPanelEntry, RawBuffer};
 use crate::messages::prelude::*;
 use crate::messages::tool::utility_types::HintData;
 
-use graphene::color::Color;
-use graphene::layers::imaginate_layer::{ImaginateBaseImage, ImaginateGenerationParameters, ImaginateMaskFillContent, ImaginateMaskPaintMode};
-use graphene::layers::text_layer::Font;
-use graphene::LayerId;
+use graph_craft::document::NodeId;
+use graphene_core::raster::color::Color;
+use graphene_core::text::Font;
 
-use serde::{Deserialize, Serialize};
-
-#[remain::sorted]
 #[impl_message(Message, Frontend)]
-#[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]
 pub enum FrontendMessage {
 	// Display prefix: make the frontend show something, like a dialog
 	DisplayDialog {
+		title: String,
 		icon: String,
 	},
 	DisplayDialogDismiss,
 	DisplayDialogPanic {
 		#[serde(rename = "panicInfo")]
 		panic_info: String,
-		header: String,
-		description: String,
 	},
 	DisplayEditableTextbox {
 		text: String,
@@ -36,6 +29,11 @@ pub enum FrontendMessage {
 		#[serde(rename = "fontSize")]
 		font_size: f64,
 		color: Color,
+		url: String,
+		transform: [f64; 6],
+	},
+	DisplayEditableTextboxTransform {
+		transform: [f64; 6],
 	},
 	DisplayRemoveEditableTextbox,
 
@@ -44,73 +42,51 @@ pub enum FrontendMessage {
 		#[serde(rename = "commitDate")]
 		commit_date: String,
 	},
-	TriggerFileDownload {
+	TriggerCopyToClipboardBlobUrl {
+		#[serde(rename = "blobUrl")]
+		blob_url: String,
+	},
+	TriggerDownloadBlobUrl {
+		#[serde(rename = "layerName")]
+		layer_name: String,
+		#[serde(rename = "blobUrl")]
+		blob_url: String,
+	},
+	TriggerDownloadImage {
+		svg: String,
+		name: String,
+		mime: String,
+		size: (f64, f64),
+	},
+	TriggerDownloadTextFile {
 		document: String,
 		name: String,
+	},
+	TriggerFetchAndOpenDocument {
+		name: String,
+		filename: String,
 	},
 	TriggerFontLoad {
 		font: Font,
 		#[serde(rename = "isDefault")]
 		is_default: bool,
 	},
-	TriggerImaginateCheckServerStatus {
-		hostname: String,
-	},
-	TriggerImaginateGenerate {
-		parameters: ImaginateGenerationParameters,
-		#[serde(rename = "baseImage")]
-		base_image: Option<ImaginateBaseImage>,
-		#[serde(rename = "maskImage")]
-		mask_image: Option<ImaginateBaseImage>,
-		#[serde(rename = "maskPaintMode")]
-		mask_paint_mode: ImaginateMaskPaintMode,
-		#[serde(rename = "maskBlurPx")]
-		mask_blur_px: u32,
-		#[serde(rename = "maskFillContent")]
-		mask_fill_content: ImaginateMaskFillContent,
-		hostname: String,
-		#[serde(rename = "refreshFrequency")]
-		refresh_frequency: f64,
-		#[serde(rename = "documentId")]
-		document_id: u64,
-		#[serde(rename = "layerPath")]
-		layer_path: Vec<LayerId>,
-	},
-	TriggerImaginateTerminate {
-		#[serde(rename = "documentId")]
-		document_id: u64,
-		#[serde(rename = "layerPath")]
-		layer_path: Vec<LayerId>,
-		hostname: String,
+	TriggerGraphViewOverlay {
+		open: bool,
 	},
 	TriggerImport,
 	TriggerIndexedDbRemoveDocument {
 		#[serde(rename = "documentId")]
-		document_id: u64,
+		document_id: DocumentId,
 	},
 	TriggerIndexedDbWriteDocument {
 		document: String,
 		details: FrontendDocumentDetails,
-		version: String,
 	},
 	TriggerLoadAutoSaveDocuments,
 	TriggerLoadPreferences,
-	TriggerNodeGraphFrameGenerate {
-		#[serde(rename = "documentId")]
-		document_id: u64,
-		#[serde(rename = "layerPath")]
-		layer_path: Vec<LayerId>,
-		svg: String,
-		size: glam::DVec2,
-	},
 	TriggerOpenDocument,
 	TriggerPaste,
-	TriggerRasterDownload {
-		svg: String,
-		name: String,
-		mime: String,
-		size: (f64, f64),
-	},
 	TriggerRefreshBoundsOfViewports,
 	TriggerRevokeBlobUrl {
 		url: String,
@@ -131,15 +107,34 @@ pub enum FrontendMessage {
 	// Update prefix: give the frontend a new value or state for it to use
 	UpdateActiveDocument {
 		#[serde(rename = "documentId")]
-		document_id: u64,
+		document_id: DocumentId,
 	},
-	UpdateDialogDetails {
+	UpdateBox {
+		#[serde(rename = "box")]
+		box_selection: Option<BoxSelection>,
+	},
+	UpdateContextMenuInformation {
+		#[serde(rename = "contextMenuInformation")]
+		context_menu_information: Option<ContextMenuInformation>,
+	},
+	UpdateLayerWidths {
+		#[serde(rename = "layerWidths")]
+		layer_widths: HashMap<NodeId, u32>,
+	},
+	UpdateDialogButtons {
 		#[serde(rename = "layoutTarget")]
 		layout_target: LayoutTarget,
-		layout: SubLayout,
+		diff: Vec<WidgetDiff>,
 	},
-	UpdateDocumentArtboards {
-		svg: String,
+	UpdateDialogColumn1 {
+		#[serde(rename = "layoutTarget")]
+		layout_target: LayoutTarget,
+		diff: Vec<WidgetDiff>,
+	},
+	UpdateDialogColumn2 {
+		#[serde(rename = "layoutTarget")]
+		layout_target: LayoutTarget,
+		diff: Vec<WidgetDiff>,
 	},
 	UpdateDocumentArtwork {
 		svg: String,
@@ -147,27 +142,29 @@ pub enum FrontendMessage {
 	UpdateDocumentBarLayout {
 		#[serde(rename = "layoutTarget")]
 		layout_target: LayoutTarget,
-		layout: SubLayout,
+		diff: Vec<WidgetDiff>,
 	},
 	UpdateDocumentLayerDetails {
 		data: LayerPanelEntry,
 	},
-	UpdateDocumentLayerTreeStructure {
+	UpdateDocumentLayerStructure {
 		#[serde(rename = "dataBuffer")]
 		data_buffer: RawBuffer,
+	},
+	UpdateDocumentLayerStructureJs {
+		#[serde(rename = "dataBuffer")]
+		data_buffer: JsRawBuffer,
 	},
 	UpdateDocumentModeLayout {
 		#[serde(rename = "layoutTarget")]
 		layout_target: LayoutTarget,
-		layout: SubLayout,
-	},
-	UpdateDocumentOverlays {
-		svg: String,
+		diff: Vec<WidgetDiff>,
 	},
 	UpdateDocumentRulers {
 		origin: (f64, f64),
 		spacing: f64,
 		interval: f64,
+		visible: bool,
 	},
 	UpdateDocumentScrollbars {
 		position: (f64, f64),
@@ -184,20 +181,14 @@ pub enum FrontendMessage {
 		#[serde(rename = "setColorChoice")]
 		set_color_choice: Option<String>,
 	},
-	UpdateImageData {
-		#[serde(rename = "documentId")]
-		document_id: u64,
-		#[serde(rename = "imageData")]
-		image_data: Vec<FrontendImageData>,
-	},
 	UpdateInputHints {
 		#[serde(rename = "hintData")]
 		hint_data: HintData,
 	},
-	UpdateLayerTreeOptionsLayout {
+	UpdateLayersPanelOptionsLayout {
 		#[serde(rename = "layoutTarget")]
 		layout_target: LayoutTarget,
-		layout: SubLayout,
+		diff: Vec<WidgetDiff>,
 	},
 	UpdateMenuBarLayout {
 		#[serde(rename = "layoutTarget")]
@@ -209,10 +200,22 @@ pub enum FrontendMessage {
 	},
 	UpdateNodeGraph {
 		nodes: Vec<FrontendNode>,
-		links: Vec<FrontendNodeLink>,
+		wires: Vec<FrontendNodeWire>,
 	},
-	UpdateNodeGraphVisibility {
-		visible: bool,
+	UpdateNodeGraphBarLayout {
+		#[serde(rename = "layoutTarget")]
+		layout_target: LayoutTarget,
+		diff: Vec<WidgetDiff>,
+	},
+	UpdateNodeGraphSelection {
+		selected: Vec<NodeId>,
+	},
+	UpdateNodeGraphTransform {
+		transform: Transform,
+	},
+	UpdateNodeThumbnail {
+		id: NodeId,
+		value: String,
 	},
 	UpdateNodeTypes {
 		#[serde(rename = "nodeTypes")]
@@ -225,26 +228,38 @@ pub enum FrontendMessage {
 	UpdatePropertyPanelOptionsLayout {
 		#[serde(rename = "layoutTarget")]
 		layout_target: LayoutTarget,
-		layout: SubLayout,
+		diff: Vec<WidgetDiff>,
 	},
 	UpdatePropertyPanelSectionsLayout {
 		#[serde(rename = "layoutTarget")]
 		layout_target: LayoutTarget,
-		layout: SubLayout,
+		diff: Vec<WidgetDiff>,
+	},
+	UpdateSubgraphPath {
+		#[serde(rename = "subgraphPath")]
+		subgraph_path: Vec<String>,
 	},
 	UpdateToolOptionsLayout {
 		#[serde(rename = "layoutTarget")]
 		layout_target: LayoutTarget,
-		layout: SubLayout,
+		diff: Vec<WidgetDiff>,
 	},
 	UpdateToolShelfLayout {
 		#[serde(rename = "layoutTarget")]
 		layout_target: LayoutTarget,
-		layout: SubLayout,
+		diff: Vec<WidgetDiff>,
+	},
+	UpdateWirePathInProgress {
+		#[serde(rename = "wirePath")]
+		wire_path: Option<WirePath>,
 	},
 	UpdateWorkingColorsLayout {
 		#[serde(rename = "layoutTarget")]
 		layout_target: LayoutTarget,
-		layout: SubLayout,
+		diff: Vec<WidgetDiff>,
+	},
+	UpdateZoomWithScroll {
+		#[serde(rename = "zoomWithScroll")]
+		zoom_with_scroll: bool,
 	},
 }

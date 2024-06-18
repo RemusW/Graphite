@@ -1,19 +1,13 @@
 use crate::messages::prelude::*;
 
-use serde::{Deserialize, Serialize};
-
-#[remain::sorted]
 #[impl_message(Message, Dialog)]
-#[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum DialogMessage {
 	// Sub-messages
-	#[remain::unsorted]
 	#[child]
 	ExportDialog(ExportDialogMessage),
-	#[remain::unsorted]
 	#[child]
 	NewDocumentDialog(NewDocumentDialogMessage),
-	#[remain::unsorted]
 	#[child]
 	PreferencesDialog(PreferencesDialogMessage),
 
@@ -29,11 +23,16 @@ pub enum DialogMessage {
 	RequestAboutGraphiteDialog,
 	RequestAboutGraphiteDialogWithLocalizedCommitDate {
 		localized_commit_date: String,
+		localized_commit_year: String,
 	},
 	RequestComingSoonDialog {
-		issue: Option<i32>,
+		issue: Option<u32>,
 	},
+	RequestDemoArtworkDialog,
 	RequestExportDialog,
+	RequestLicensesDialogWithLocalizedCommitDate {
+		localized_commit_year: String,
+	},
 	RequestNewDocumentDialog,
 	RequestPreferencesDialog,
 }

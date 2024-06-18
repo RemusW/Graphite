@@ -1,75 +1,141 @@
-use crate::consts::DRAG_THRESHOLD;
-use crate::messages::frontend::utility_types::MouseCursorIcon;
-use crate::messages::input_mapper::utility_types::input_keyboard::{Key, KeysGroup, MouseMotion};
-use crate::messages::layout::utility_types::layout_widget::PropertyHolder;
-use crate::messages::prelude::*;
+use super::tool_prelude::*;
+use crate::messages::portfolio::document::{graph_operation::utility_types::TransformIn, overlays::utility_types::OverlayContext};
+use crate::messages::tool::common_functionality::auto_panning::AutoPanning;
+use crate::messages::tool::common_functionality::color_selector::{ToolColorOptions, ToolColorType};
+use crate::messages::tool::common_functionality::graph_modification_utils;
 use crate::messages::tool::common_functionality::resize::Resize;
-use crate::messages::tool::utility_types::{EventToMessageMap, Fsm, ToolActionHandlerData, ToolMetadata, ToolTransition, ToolType};
-use crate::messages::tool::utility_types::{HintData, HintGroup, HintInfo};
+use crate::messages::tool::common_functionality::snapping::SnapData;
 
-use graphene::layers::style;
-use graphene::Operation;
-
-use glam::DAffine2;
-use serde::{Deserialize, Serialize};
+use graph_craft::document::NodeId;
+use graphene_core::uuid::generate_uuid;
+use graphene_core::vector::style::{Fill, Stroke};
+use graphene_core::Color;
 
 #[derive(Default)]
 pub struct RectangleTool {
 	fsm_state: RectangleToolFsmState,
 	tool_data: RectangleToolData,
+	options: RectangleToolOptions,
 }
 
-#[remain::sorted]
+pub struct RectangleToolOptions {
+	line_weight: f64,
+	fill: ToolColorOptions,
+	stroke: ToolColorOptions,
+}
+
+impl Default for RectangleToolOptions {
+	fn default() -> Self {
+		Self {
+			line_weight: 5.,
+			fill: ToolColorOptions::new_secondary(),
+			stroke: ToolColorOptions::new_primary(),
+		}
+	}
+}
+
+#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]
+pub enum RectangleOptionsUpdate {
+	FillColor(Option<Color>),
+	FillColorType(ToolColorType),
+	LineWeight(f64),
+	StrokeColor(Option<Color>),
+	StrokeColorType(ToolColorType),
+	WorkingColors(Option<Color>, Option<Color>),
+}
+
 #[impl_message(Message, ToolMessage, Rectangle)]
-#[derive(PartialEq, Eq, Clone, Debug, Hash, Serialize, Deserialize)]
+#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]
 pub enum RectangleToolMessage {
 	// Standard messages
-	#[remain::unsorted]
+	Overlays(OverlayContext),
 	Abort,
+	WorkingColorChanged,
 
 	// Tool-specific messages
 	DragStart,
 	DragStop,
-	Resize {
-		center: Key,
-		lock_ratio: Key,
-	},
+	PointerMove { center: Key, lock_ratio: Key },
+	PointerOutsideViewport { center: Key, lock_ratio: Key },
+	UpdateOptions(RectangleOptionsUpdate),
 }
 
-impl PropertyHolder for RectangleTool {}
+fn create_weight_widget(line_weight: f64) -> WidgetHolder {
+	NumberInput::new(Some(line_weight))
+		.unit(" px")
+		.label("Weight")
+		.min(0.)
+		.max((1_u64 << std::f64::MANTISSA_DIGITS) as f64)
+		.on_update(|number_input: &NumberInput| RectangleToolMessage::UpdateOptions(RectangleOptionsUpdate::LineWeight(number_input.value.unwrap())).into())
+		.widget_holder()
+}
 
-impl<'a> MessageHandler<ToolMessage, ToolActionHandlerData<'a>> for RectangleTool {
-	fn process_message(&mut self, message: ToolMessage, tool_data: ToolActionHandlerData<'a>, responses: &mut VecDeque<Message>) {
-		if message == ToolMessage::UpdateHints {
-			self.fsm_state.update_hints(responses);
+impl LayoutHolder for RectangleTool {
+	fn layout(&self) -> Layout {
+		let mut widgets = self.options.fill.create_widgets(
+			"Fill",
+			true,
+			|_| RectangleToolMessage::UpdateOptions(RectangleOptionsUpdate::FillColor(None)).into(),
+			|color_type: ToolColorType| WidgetCallback::new(move |_| RectangleToolMessage::UpdateOptions(RectangleOptionsUpdate::FillColorType(color_type.clone())).into()),
+			|color: &ColorButton| RectangleToolMessage::UpdateOptions(RectangleOptionsUpdate::FillColor(color.value.as_solid())).into(),
+		);
+
+		widgets.push(Separator::new(SeparatorType::Unrelated).widget_holder());
+
+		widgets.append(&mut self.options.stroke.create_widgets(
+			"Stroke",
+			true,
+			|_| RectangleToolMessage::UpdateOptions(RectangleOptionsUpdate::StrokeColor(None)).into(),
+			|color_type: ToolColorType| WidgetCallback::new(move |_| RectangleToolMessage::UpdateOptions(RectangleOptionsUpdate::StrokeColorType(color_type.clone())).into()),
+			|color: &ColorButton| RectangleToolMessage::UpdateOptions(RectangleOptionsUpdate::StrokeColor(color.value.as_solid())).into(),
+		));
+		widgets.push(Separator::new(SeparatorType::Unrelated).widget_holder());
+		widgets.push(create_weight_widget(self.options.line_weight));
+
+		Layout::WidgetLayout(WidgetLayout::new(vec![LayoutGroup::Row { widgets }]))
+	}
+}
+
+impl<'a> MessageHandler<ToolMessage, &mut ToolActionHandlerData<'a>> for RectangleTool {
+	fn process_message(&mut self, message: ToolMessage, responses: &mut VecDeque<Message>, tool_data: &mut ToolActionHandlerData<'a>) {
+		let ToolMessage::Rectangle(RectangleToolMessage::UpdateOptions(action)) = message else {
+			self.fsm_state.process_event(message, &mut self.tool_data, tool_data, &self.options, responses, true);
 			return;
+		};
+
+		match action {
+			RectangleOptionsUpdate::FillColor(color) => {
+				self.options.fill.custom_color = color;
+				self.options.fill.color_type = ToolColorType::Custom;
+			}
+			RectangleOptionsUpdate::FillColorType(color_type) => self.options.fill.color_type = color_type,
+			RectangleOptionsUpdate::LineWeight(line_weight) => self.options.line_weight = line_weight,
+			RectangleOptionsUpdate::StrokeColor(color) => {
+				self.options.stroke.custom_color = color;
+				self.options.stroke.color_type = ToolColorType::Custom;
+			}
+			RectangleOptionsUpdate::StrokeColorType(color_type) => self.options.stroke.color_type = color_type,
+			RectangleOptionsUpdate::WorkingColors(primary, secondary) => {
+				self.options.stroke.primary_working_color = primary;
+				self.options.stroke.secondary_working_color = secondary;
+				self.options.fill.primary_working_color = primary;
+				self.options.fill.secondary_working_color = secondary;
+			}
 		}
 
-		if message == ToolMessage::UpdateCursor {
-			self.fsm_state.update_cursor(responses);
-			return;
-		}
-
-		let new_state = self.fsm_state.transition(message, &mut self.tool_data, tool_data, &(), responses);
-
-		if self.fsm_state != new_state {
-			self.fsm_state = new_state;
-			self.fsm_state.update_hints(responses);
-			self.fsm_state.update_cursor(responses);
-		}
+		self.send_layout(responses, LayoutTarget::ToolOptions);
 	}
 
 	fn actions(&self) -> ActionList {
-		use RectangleToolFsmState::*;
-
 		match self.fsm_state {
-			Ready => actions!(RectangleToolMessageDiscriminant;
+			RectangleToolFsmState::Ready => actions!(RectangleToolMessageDiscriminant;
 				DragStart,
+				PointerMove,
 			),
-			Drawing => actions!(RectangleToolMessageDiscriminant;
+			RectangleToolFsmState::Drawing => actions!(RectangleToolMessageDiscriminant;
 				DragStop,
 				Abort,
-				Resize,
+				PointerMove,
 			),
 		}
 	}
@@ -90,144 +156,158 @@ impl ToolMetadata for RectangleTool {
 impl ToolTransition for RectangleTool {
 	fn event_to_message_map(&self) -> EventToMessageMap {
 		EventToMessageMap {
-			document_dirty: None,
+			overlay_provider: Some(|overlay_context| RectangleToolMessage::Overlays(overlay_context).into()),
 			tool_abort: Some(RectangleToolMessage::Abort.into()),
-			selection_changed: None,
+			working_color_changed: Some(RectangleToolMessage::WorkingColorChanged.into()),
+			..Default::default()
 		}
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RectangleToolFsmState {
+	#[default]
 	Ready,
 	Drawing,
 }
 
-impl Default for RectangleToolFsmState {
-	fn default() -> Self {
-		RectangleToolFsmState::Ready
-	}
-}
 #[derive(Clone, Debug, Default)]
 struct RectangleToolData {
 	data: Resize,
+	auto_panning: AutoPanning,
 }
 
 impl Fsm for RectangleToolFsmState {
 	type ToolData = RectangleToolData;
-	type ToolOptions = ();
+	type ToolOptions = RectangleToolOptions;
 
 	fn transition(
 		self,
 		event: ToolMessage,
 		tool_data: &mut Self::ToolData,
-		(document, _document_id, global_tool_data, input, font_cache): ToolActionHandlerData,
-		_tool_options: &Self::ToolOptions,
+		ToolActionHandlerData {
+			document, global_tool_data, input, ..
+		}: &mut ToolActionHandlerData,
+		tool_options: &Self::ToolOptions,
 		responses: &mut VecDeque<Message>,
 	) -> Self {
-		use RectangleToolFsmState::*;
-		use RectangleToolMessage::*;
+		let shape_data = &mut tool_data.data;
 
-		let mut shape_data = &mut tool_data.data;
+		let ToolMessage::Rectangle(event) = event else {
+			return self;
+		};
 
-		if let ToolMessage::Rectangle(event) = event {
-			match (self, event) {
-				(Ready, DragStart) => {
-					shape_data.start(responses, document, input.mouse.position, font_cache);
-					responses.push_back(DocumentMessage::StartTransaction.into());
-					shape_data.path = Some(document.get_path_for_new_layer());
-					responses.push_back(DocumentMessage::DeselectAllLayers.into());
-
-					responses.push_back(
-						Operation::AddRect {
-							path: shape_data.path.clone().unwrap(),
-							insert_index: -1,
-							transform: DAffine2::ZERO.to_cols_array(),
-							style: style::PathStyle::new(None, style::Fill::solid(global_tool_data.primary_color)),
-						}
-						.into(),
-					);
-
-					Drawing
-				}
-				(state, Resize { center, lock_ratio }) => {
-					if let Some(message) = shape_data.calculate_transform(responses, document, center, lock_ratio, input) {
-						responses.push_back(message);
-					}
-
-					state
-				}
-				(Drawing, DragStop) => {
-					match shape_data.drag_start.distance(input.mouse.position) <= DRAG_THRESHOLD {
-						true => responses.push_back(DocumentMessage::AbortTransaction.into()),
-						false => responses.push_back(DocumentMessage::CommitTransaction.into()),
-					}
-
-					shape_data.cleanup(responses);
-
-					Ready
-				}
-				(Drawing, Abort) => {
-					responses.push_back(DocumentMessage::AbortTransaction.into());
-
-					shape_data.cleanup(responses);
-
-					Ready
-				}
-				_ => self,
+		match (self, event) {
+			(_, RectangleToolMessage::Overlays(mut overlay_context)) => {
+				shape_data.snap_manager.draw_overlays(SnapData::new(document, input), &mut overlay_context);
+				self
 			}
-		} else {
-			self
+			(RectangleToolFsmState::Ready, RectangleToolMessage::DragStart) => {
+				shape_data.start(document, input);
+
+				let subpath = bezier_rs::Subpath::new_rect(DVec2::ZERO, DVec2::ONE);
+
+				responses.add(DocumentMessage::StartTransaction);
+
+				let layer = graph_modification_utils::new_vector_layer(vec![subpath], NodeId(generate_uuid()), document.new_layer_parent(true), responses);
+				shape_data.layer = Some(layer);
+
+				responses.add(GraphOperationMessage::TransformSet {
+					layer,
+					transform: DAffine2::from_scale_angle_translation(DVec2::ONE, 0., input.mouse.position),
+					transform_in: TransformIn::Viewport,
+					skip_rerender: false,
+				});
+
+				let fill_color = tool_options.fill.active_color();
+				responses.add(GraphOperationMessage::FillSet {
+					layer,
+					fill: if let Some(color) = fill_color { Fill::Solid(color) } else { Fill::None },
+				});
+
+				responses.add(GraphOperationMessage::StrokeSet {
+					layer,
+					stroke: Stroke::new(tool_options.stroke.active_color(), tool_options.line_weight),
+				});
+
+				RectangleToolFsmState::Drawing
+			}
+			(RectangleToolFsmState::Drawing, RectangleToolMessage::PointerMove { center, lock_ratio }) => {
+				if let Some(message) = shape_data.calculate_transform(document, input, center, lock_ratio, false) {
+					responses.add(message);
+				}
+
+				// Auto-panning
+				let messages = [
+					RectangleToolMessage::PointerOutsideViewport { center, lock_ratio }.into(),
+					RectangleToolMessage::PointerMove { center, lock_ratio }.into(),
+				];
+				tool_data.auto_panning.setup_by_mouse_position(input, &messages, responses);
+
+				self
+			}
+			(_, RectangleToolMessage::PointerMove { .. }) => {
+				shape_data.snap_manager.preview_draw(&SnapData::new(document, input), input.mouse.position);
+				responses.add(OverlaysMessage::Draw);
+				self
+			}
+			(RectangleToolFsmState::Drawing, RectangleToolMessage::PointerOutsideViewport { .. }) => {
+				// Auto-panning
+				let _ = tool_data.auto_panning.shift_viewport(input, responses);
+
+				RectangleToolFsmState::Drawing
+			}
+			(state, RectangleToolMessage::PointerOutsideViewport { center, lock_ratio }) => {
+				// Auto-panning
+				let messages = [
+					RectangleToolMessage::PointerOutsideViewport { center, lock_ratio }.into(),
+					RectangleToolMessage::PointerMove { center, lock_ratio }.into(),
+				];
+				tool_data.auto_panning.stop(&messages, responses);
+
+				state
+			}
+			(RectangleToolFsmState::Drawing, RectangleToolMessage::DragStop) => {
+				input.mouse.finish_transaction(shape_data.viewport_drag_start(document), responses);
+				shape_data.cleanup(responses);
+
+				RectangleToolFsmState::Ready
+			}
+			(RectangleToolFsmState::Drawing, RectangleToolMessage::Abort) => {
+				responses.add(DocumentMessage::AbortTransaction);
+
+				shape_data.cleanup(responses);
+
+				RectangleToolFsmState::Ready
+			}
+			(_, RectangleToolMessage::WorkingColorChanged) => {
+				responses.add(RectangleToolMessage::UpdateOptions(RectangleOptionsUpdate::WorkingColors(
+					Some(global_tool_data.primary_color),
+					Some(global_tool_data.secondary_color),
+				)));
+				self
+			}
+			_ => self,
 		}
 	}
 
 	fn update_hints(&self, responses: &mut VecDeque<Message>) {
 		let hint_data = match self {
 			RectangleToolFsmState::Ready => HintData(vec![HintGroup(vec![
-				HintInfo {
-					key_groups: vec![],
-					key_groups_mac: None,
-					mouse: Some(MouseMotion::LmbDrag),
-					label: String::from("Draw Rectangle"),
-					plus: false,
-				},
-				HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Shift])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("Constrain Square"),
-					plus: true,
-				},
-				HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Alt])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("From Center"),
-					plus: true,
-				},
+				HintInfo::mouse(MouseMotion::LmbDrag, "Draw Rectangle"),
+				HintInfo::keys([Key::Shift], "Constrain Square").prepend_plus(),
+				HintInfo::keys([Key::Alt], "From Center").prepend_plus(),
 			])]),
-			RectangleToolFsmState::Drawing => HintData(vec![HintGroup(vec![
-				HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Shift])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("Constrain Square"),
-					plus: false,
-				},
-				HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Alt])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("From Center"),
-					plus: false,
-				},
-			])]),
+			RectangleToolFsmState::Drawing => HintData(vec![
+				HintGroup(vec![HintInfo::mouse(MouseMotion::Rmb, ""), HintInfo::keys([Key::Escape], "Cancel").prepend_slash()]),
+				HintGroup(vec![HintInfo::keys([Key::Shift], "Constrain Square"), HintInfo::keys([Key::Alt], "From Center")]),
+			]),
 		};
 
-		responses.push_back(FrontendMessage::UpdateInputHints { hint_data }.into());
+		responses.add(FrontendMessage::UpdateInputHints { hint_data });
 	}
 
 	fn update_cursor(&self, responses: &mut VecDeque<Message>) {
-		responses.push_back(FrontendMessage::UpdateMouseCursor { cursor: MouseCursorIcon::Crosshair }.into());
+		responses.add(FrontendMessage::UpdateMouseCursor { cursor: MouseCursorIcon::Crosshair });
 	}
 }

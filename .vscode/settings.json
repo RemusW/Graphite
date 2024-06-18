@@ -3,48 +3,56 @@
 	"[rust]": {
 		"editor.formatOnSave": true,
 		"editor.formatOnPaste": true,
-		"editor.defaultFormatter": "rust-lang.rust-analyzer",
+		"editor.defaultFormatter": "rust-lang.rust-analyzer"
 	},
 	// Web: save on format
-	"[typescript][javascript][vue]": {
+	"[javascript][typescript][svelte]": {
 		"editor.codeActionsOnSave": {
-			"source.fixAll.eslint": true,
+			"source.fixAll.eslint": "explicit"
 		},
 		"editor.formatOnSave": true,
-		"editor.defaultFormatter": "dbaeumer.vscode-eslint",
+		"editor.defaultFormatter": "dbaeumer.vscode-eslint"
 	},
 	"[scss]": {
 		"editor.codeActionsOnSave": {
-			"source.fixAll.eslint": true,
+			"source.fixAll.eslint": "explicit"
 		},
 		"editor.formatOnSave": true,
-		"editor.defaultFormatter": "esbenp.prettier-vscode",
+		// Configured in `.prettierrc`
+		"editor.defaultFormatter": "esbenp.prettier-vscode"
+	},
+	"[json][jsonc][yaml][github-actions-workflow]": {
+		"editor.formatOnSave": true,
+		// Configured in `.prettierrc`
+		"editor.defaultFormatter": "esbenp.prettier-vscode"
 	},
 	// Handlebars: don't save on format
 	// (`about.hbs` is used by Cargo About to encode license information)
 	"[handlebars]": {
-		"editor.formatOnSave": false,
+		"editor.formatOnSave": false
 	},
 	// Rust Analyzer config
 	"rust-analyzer.cargo.target": "wasm32-unknown-unknown",
-	"rust-analyzer.checkOnSave.command": "clippy",
+	"rust-analyzer.check.command": "clippy",
+	"rust-analyzer.cargo.buildScripts.overrideCommand": ["cargo", "check", "--quiet", "--message-format=json", "--all-targets", "-p", "graphite-wasm"], // Build scripts for Tauri aren't compatible with wasm32-unknown-unknown, so this restricts it to just our code entry point
 	"rust-analyzer.diagnostics.disabled": ["unresolved-macro-call"], // Remove when https://github.com/rust-lang/rust-analyzer/issues/6835 is fixed
 	// ESLint config
 	"eslint.format.enable": true,
-	"eslint.workingDirectories": [
-		"./frontend",
-		"./website/other/bezier-rs-demos",
-		"./website",
-	],
-	"eslint.validate": [
-		"javascript",
-		"typescript",
-	],
-	// Vue config
-	"volar.completion.preferredAttrNameCase": "camel",
-	"volar.completion.preferredTagNameCase": "pascal",
+	"eslint.workingDirectories": ["./frontend", "./website/other/bezier-rs-demos", "./website"],
+	"eslint.validate": ["javascript", "typescript", "svelte"],
+	// Svelte config
+	"svelte.plugin.svelte.compilerWarnings": {
+		// NOTICE: Keep this list in sync with the list in `frontend/vite.config.ts`
+		"css-unused-selector": "ignore",
+		"vite-plugin-svelte-css-no-scopable-elements": "ignore",
+		"a11y-no-static-element-interactions": "ignore",
+		"a11y-no-noninteractive-element-interactions": "ignore"
+	},
 	// VS Code config
 	"html.format.wrapLineLength": 200,
 	"files.eol": "\n",
 	"files.insertFinalNewline": true,
+	"files.associations": {
+		"*.graphite": "json"
+	}
 }

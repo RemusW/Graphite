@@ -1,114 +1,105 @@
-use crate::messages::frontend::utility_types::{ExportBounds, FileType};
-use crate::messages::portfolio::document::utility_types::layer_panel::LayerMetadata;
-use crate::messages::portfolio::document::utility_types::misc::{AlignAggregate, AlignAxis, FlipAxis};
+use crate::messages::input_mapper::utility_types::input_keyboard::Key;
+use crate::messages::portfolio::document::overlays::utility_types::OverlayContext;
+use crate::messages::portfolio::document::utility_types::document_metadata::LayerNodeIdentifier;
+use crate::messages::portfolio::document::utility_types::misc::{AlignAggregate, AlignAxis, FlipAxis, GridSnapping};
 use crate::messages::prelude::*;
 
-use graphene::boolean_ops::BooleanOperation as BooleanOperationType;
-use graphene::layers::blend_mode::BlendMode;
-use graphene::layers::style::ViewMode;
-use graphene::LayerId;
-use graphene::Operation as DocumentOperation;
-use serde::{Deserialize, Serialize};
+use graph_craft::document::{NodeId, NodeNetwork};
+use graphene_core::raster::BlendMode;
+use graphene_core::raster::Image;
+use graphene_core::vector::style::ViewMode;
+use graphene_core::Color;
 
-#[remain::sorted]
+use glam::DAffine2;
+
+use super::utility_types::misc::{OptionBoundsSnapping, OptionPointSnapping};
+
 #[impl_message(Message, PortfolioMessage, Document)]
-#[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum DocumentMessage {
+	Noop,
 	// Sub-messages
-	#[remain::unsorted]
-	DispatchOperation(Box<DocumentOperation>),
-	#[remain::unsorted]
 	#[child]
-	Artboard(ArtboardMessage),
-	#[remain::unsorted]
+	GraphOperation(GraphOperationMessage),
 	#[child]
 	Navigation(NavigationMessage),
-	#[remain::unsorted]
-	#[child]
-	Overlays(OverlaysMessage),
-	#[remain::unsorted]
-	#[child]
-	TransformLayer(TransformLayerMessage),
-	#[remain::unsorted]
-	#[child]
-	PropertiesPanel(PropertiesPanelMessage),
-	#[remain::unsorted]
 	#[child]
 	NodeGraph(NodeGraphMessage),
+	#[child]
+	Overlays(OverlaysMessage),
+	#[child]
+	PropertiesPanel(PropertiesPanelMessage),
 
 	// Messages
 	AbortTransaction,
-	AddSelectedLayers {
-		additional_layers: Vec<Vec<LayerId>>,
-	},
 	AlignSelectedLayers {
 		axis: AlignAxis,
 		aggregate: AlignAggregate,
 	},
-	BooleanOperation(BooleanOperationType),
-	CommitTransaction,
-	CreateEmptyFolder {
-		container_path: Vec<LayerId>,
+	BackupDocument {
+		network: NodeNetwork,
 	},
+	ClearArtboards,
+	ClearLayersPanel,
+	CommitTransaction,
+	CreateEmptyFolder,
 	DebugPrintDocument,
 	DeleteLayer {
-		layer_path: Vec<LayerId>,
+		layer: LayerNodeIdentifier,
 	},
 	DeleteSelectedLayers,
-	DeleteSelectedManipulatorPoints,
 	DeselectAllLayers,
-	DeselectAllManipulatorPoints,
-	DirtyRenderDocument,
-	DirtyRenderDocumentInOutlineView,
 	DocumentHistoryBackward,
 	DocumentHistoryForward,
 	DocumentStructureChanged,
 	DuplicateSelectedLayers,
-	ExportDocument {
-		file_name: String,
-		file_type: FileType,
-		scale_factor: f64,
-		bounds: ExportBounds,
-	},
 	FlipSelectedLayers {
 		flip_axis: FlipAxis,
 	},
-	FolderChanged {
-		affected_folder_path: Vec<LayerId>,
+	GraphViewOverlay {
+		open: bool,
 	},
-	FrameClear,
+	GraphViewOverlayToggle,
+	GridOptions(GridSnapping),
+	GridOverlays(OverlayContext),
+	GridVisibility(bool),
 	GroupSelectedLayers,
 	ImaginateGenerate,
-	ImaginateTerminate,
-	LayerChanged {
-		affected_layer_path: Vec<LayerId>,
+	ImaginateRandom {
+		imaginate_node: Vec<NodeId>,
+		then_generate: bool,
+	},
+	ImportSvg {
+		id: NodeId,
+		svg: String,
+		transform: DAffine2,
+		parent: LayerNodeIdentifier,
+		insert_index: isize,
 	},
 	MoveSelectedLayersTo {
-		folder_path: Vec<LayerId>,
+		parent: LayerNodeIdentifier,
 		insert_index: isize,
-		reverse_index: bool,
 	},
-	MoveSelectedManipulatorPoints {
-		layer_path: Vec<LayerId>,
-		delta: (f64, f64),
-	},
-	NodeGraphFrameGenerate,
 	NudgeSelectedLayers {
 		delta_x: f64,
 		delta_y: f64,
+		resize: Key,
+		resize_opposite_corner: Key,
 	},
 	PasteImage {
-		mime: String,
-		image_data: Vec<u8>,
+		image: Image<Color>,
+		mouse: Option<(f64, f64)>,
+	},
+	PasteSvg {
+		svg: String,
 		mouse: Option<(f64, f64)>,
 	},
 	Redo,
-	RenameLayer {
-		layer_path: Vec<LayerId>,
+	RenameDocument {
 		new_name: String,
 	},
-	RenderDocument,
-	RollbackTransaction,
+	RenderRulers,
+	RenderScrollbars,
 	SaveDocument,
 	SelectAllLayers,
 	SelectedLayersLower,
@@ -119,26 +110,12 @@ pub enum DocumentMessage {
 		relative_index_offset: isize,
 	},
 	SelectLayer {
-		layer_path: Vec<LayerId>,
+		id: NodeId,
 		ctrl: bool,
 		shift: bool,
 	},
 	SetBlendModeForSelectedLayers {
 		blend_mode: BlendMode,
-	},
-	SetImageBlobUrl {
-		layer_path: Vec<LayerId>,
-		blob_url: String,
-		resolution: (f64, f64),
-		document_id: u64,
-	},
-	SetLayerExpansion {
-		layer_path: Vec<LayerId>,
-		set_expanded: bool,
-	},
-	SetLayerName {
-		layer_path: Vec<LayerId>,
-		name: String,
 	},
 	SetOpacityForSelectedLayers {
 		opacity: f64,
@@ -146,53 +123,31 @@ pub enum DocumentMessage {
 	SetOverlaysVisibility {
 		visible: bool,
 	},
-	SetSelectedLayers {
-		replacement_selected_layers: Vec<Vec<LayerId>>,
+	SetRangeSelectionLayer {
+		new_layer: Option<LayerNodeIdentifier>,
 	},
 	SetSnapping {
-		snap: bool,
-	},
-	SetTextboxEditability {
-		path: Vec<LayerId>,
-		editable: bool,
+		snapping_enabled: Option<bool>,
+		bounding_box_snapping: Option<OptionBoundsSnapping>,
+		geometry_snapping: Option<OptionPointSnapping>,
 	},
 	SetViewMode {
 		view_mode: ViewMode,
 	},
 	StartTransaction,
 	ToggleLayerExpansion {
-		layer_path: Vec<LayerId>,
+		id: NodeId,
 	},
-	ToggleLayerVisibility {
-		layer_path: Vec<LayerId>,
-	},
-	ToggleSelectedHandleMirroring {
-		layer_path: Vec<LayerId>,
-		toggle_distance: bool,
-		toggle_angle: bool,
-	},
+	ToggleGridVisibility,
+	ToggleOverlaysVisibility,
+	ToggleSnapping,
 	Undo,
-	UngroupLayers {
-		folder_path: Vec<LayerId>,
-	},
+	UndoFinished,
 	UngroupSelectedLayers,
-	UpdateLayerMetadata {
-		layer_path: Vec<LayerId>,
-		layer_metadata: LayerMetadata,
+	UpdateDocumentTransform {
+		transform: glam::DAffine2,
 	},
 	ZoomCanvasTo100Percent,
 	ZoomCanvasTo200Percent,
 	ZoomCanvasToFitAll,
-}
-
-impl From<DocumentOperation> for DocumentMessage {
-	fn from(operation: DocumentOperation) -> DocumentMessage {
-		DocumentMessage::DispatchOperation(Box::new(operation))
-	}
-}
-
-impl From<DocumentOperation> for Message {
-	fn from(operation: DocumentOperation) -> Message {
-		DocumentMessage::DispatchOperation(Box::new(operation)).into()
-	}
 }

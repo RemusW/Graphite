@@ -3,7 +3,6 @@
 		"target": "ES2020",
 		"module": "esnext",
 		"strict": true,
-		"jsx": "preserve",
 		"importHelpers": true,
 		"moduleResolution": "node",
 		"experimentalDecorators": true,
@@ -12,9 +11,6 @@
 		"allowSyntheticDefaultImports": true,
 		"sourceMap": true,
 		"baseUrl": ".",
-		"types": [
-			"node"
-		],
 		"paths": {
 			"@/*": [
 				"src/*"
@@ -30,10 +26,18 @@
 	"include": [
 		"src/**/*.ts",
 		"src/**/*.d.ts",
-		"src/**/*.vue",
-		"tests/**/*.ts",
+		"*.ts",
+		"*.js",
+		"*.cjs"
 	],
 	"exclude": [
 		"node_modules"
-	]
+	],
+	"ts-node": {
+		"compilerOptions": {
+			"module": "commonjs",
+			"useDefineForClassFields": false,
+			"noImplicitOverride": true
+		}
+	}
 }

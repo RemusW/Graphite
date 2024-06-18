@@ -5,7 +5,7 @@ extern crate proc_macro;
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, GenericParam, Lifetime, LifetimeDef, TypeParamBound};
+use syn::{parse_macro_input, DeriveInput, GenericParam, Lifetime, LifetimeParam, TypeParamBound};
 
 /// Derives an implementation for the [`DynAny`] trait.
 ///
@@ -46,7 +46,7 @@ pub fn system_desc_derive(input: TokenStream) -> TokenStream {
 
 	let old_params = &generics.params.iter().collect::<Vec<_>>();
 	quote! {
-		impl<'dyn_any, #(#old_params,)*> StaticType for #struct_name <#(#dyn_params,)*> {
+		unsafe impl<'dyn_any, #(#old_params,)*> StaticType for #struct_name <#(#dyn_params,)*> {
 			type Static =  #struct_name <#(#static_params,)*>;
 		}
 	}
@@ -59,7 +59,7 @@ fn replace_lifetimes(generics: &syn::Generics, replacement: &str) -> Vec<proc_ma
 		.iter()
 		.map(|param| {
 			let param = match param {
-				GenericParam::Lifetime(_) => GenericParam::Lifetime(LifetimeDef::new(Lifetime::new(replacement, Span::call_site()))),
+				GenericParam::Lifetime(_) => GenericParam::Lifetime(LifetimeParam::new(Lifetime::new(replacement, Span::call_site()))),
 				GenericParam::Type(t) => {
 					let mut t = t.clone();
 					t.bounds.iter_mut().for_each(|bond| {

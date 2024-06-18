@@ -1,47 +1,46 @@
-use super::utility_types::ImaginateServerStatus;
+use super::document::utility_types::document_metadata::LayerNodeIdentifier;
+use crate::messages::frontend::utility_types::{ExportBounds, FileType};
 use crate::messages::portfolio::document::utility_types::clipboards::Clipboard;
 use crate::messages::prelude::*;
 
-use graphene::layers::{imaginate_layer::ImaginateStatus, text_layer::Font};
-use graphene::LayerId;
+use graphene_core::text::Font;
 
-use serde::{Deserialize, Serialize};
-
-#[remain::sorted]
 #[impl_message(Message, Portfolio)]
-#[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum PortfolioMessage {
 	// Sub-messages
-	#[remain::unsorted]
 	#[child]
 	MenuBar(MenuBarMessage),
-	#[remain::unsorted]
 	#[child]
 	Document(DocumentMessage),
 
 	// Messages
-	#[remain::unsorted]
 	DocumentPassMessage {
-		document_id: u64,
+		document_id: DocumentId,
 		message: DocumentMessage,
 	},
 	AutoSaveActiveDocument,
+	AutoSaveAllDocuments,
 	AutoSaveDocument {
-		document_id: u64,
+		document_id: DocumentId,
 	},
 	CloseActiveDocumentWithConfirmation,
 	CloseAllDocuments,
+	CloseAllDocumentsWithConfirmation,
 	CloseDocument {
-		document_id: u64,
+		document_id: DocumentId,
 	},
 	CloseDocumentWithConfirmation {
-		document_id: u64,
+		document_id: DocumentId,
 	},
 	Copy {
 		clipboard: Clipboard,
 	},
 	Cut {
 		clipboard: Clipboard,
+	},
+	DeleteDocument {
+		document_id: DocumentId,
 	},
 	DestroyAllDocuments,
 	FontLoaded {
@@ -52,29 +51,12 @@ pub enum PortfolioMessage {
 		is_default: bool,
 	},
 	ImaginateCheckServerStatus,
-	ImaginateSetBlobUrl {
-		document_id: u64,
-		layer_path: Vec<LayerId>,
-		blob_url: String,
-		resolution: (f64, f64),
-	},
-	ImaginateSetGeneratingStatus {
-		document_id: u64,
-		path: Vec<LayerId>,
-		percent: Option<f64>,
-		status: ImaginateStatus,
-	},
-	ImaginateSetImageData {
-		document_id: u64,
-		layer_path: Vec<LayerId>,
-		image_data: Vec<u8>,
-	},
-	ImaginateSetServerStatus {
-		status: ImaginateServerStatus,
-	},
+	ImaginatePollServerStatus,
+	ImaginatePreferences,
+	ImaginateServerHostname,
 	Import,
 	LoadDocumentResources {
-		document_id: u64,
+		document_id: DocumentId,
 	},
 	LoadFont {
 		font: Font,
@@ -90,43 +72,35 @@ pub enum PortfolioMessage {
 		document_serialized_content: String,
 	},
 	OpenDocumentFileWithId {
-		document_id: u64,
+		document_id: DocumentId,
 		document_name: String,
 		document_is_auto_saved: bool,
 		document_is_saved: bool,
 		document_serialized_content: String,
 	},
-	// TODO: Paste message is unused, delete it?
-	Paste {
-		clipboard: Clipboard,
-	},
 	PasteIntoFolder {
 		clipboard: Clipboard,
-		folder_path: Vec<LayerId>,
+		parent: LayerNodeIdentifier,
 		insert_index: isize,
 	},
 	PasteSerializedData {
 		data: String,
 	},
 	PrevDocument,
-	ProcessNodeGraphFrame {
-		document_id: u64,
-		layer_path: Vec<LayerId>,
-		image_data: Vec<u8>,
-		size: (u32, u32),
-	},
 	SelectDocument {
-		document_id: u64,
+		document_id: DocumentId,
 	},
-	SetActiveDocument {
-		document_id: u64,
+	SubmitDocumentExport {
+		file_name: String,
+		file_type: FileType,
+		scale_factor: f64,
+		bounds: ExportBounds,
+		transparent_background: bool,
 	},
-	SetImageBlobUrl {
-		document_id: u64,
-		layer_path: Vec<LayerId>,
-		blob_url: String,
-		resolution: (f64, f64),
+	SubmitGraphRender {
+		document_id: DocumentId,
 	},
+	ToggleRulers,
 	UpdateDocumentWidgets,
 	UpdateOpenDocumentsList,
 }

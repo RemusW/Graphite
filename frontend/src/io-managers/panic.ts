@@ -1,13 +1,10 @@
-import { wipeDocuments } from "@/io-managers/persistence";
-import { type DialogState } from "@/state-providers/dialog";
-import { type IconName } from "@/utility-functions/icons";
-import { browserVersion, operatingSystem } from "@/utility-functions/platform";
-import { stripIndents } from "@/utility-functions/strip-indents";
-import { type Editor } from "@/wasm-communication/editor";
-import type { TextLabel } from "@/wasm-communication/messages";
-import { type TextButtonWidget, type WidgetLayout, Widget, DisplayDialogPanic } from "@/wasm-communication/messages";
+import { type DialogState } from "@graphite/state-providers/dialog";
+import { browserVersion, operatingSystem } from "@graphite/utility-functions/platform";
+import { stripIndents } from "@graphite/utility-functions/strip-indents";
+import { type Editor } from "@graphite/wasm-communication/editor";
+import { DisplayDialogPanic } from "@graphite/wasm-communication/messages";
 
-export function createPanicManager(editor: Editor, dialogState: DialogState): void {
+export function createPanicManager(editor: Editor, dialogState: DialogState) {
 	// Code panic dialog and console error
 	editor.subscriptions.subscribeJsMessage(DisplayDialogPanic, (displayDialogPanic) => {
 		// `Error.stackTraceLimit` is only available in V8/Chromium
@@ -19,86 +16,65 @@ export function createPanicManager(editor: Editor, dialogState: DialogState): vo
 		// eslint-disable-next-line no-console
 		console.error(panicDetails);
 
-		const panicDialog = preparePanicDialog(displayDialogPanic.header, displayDialogPanic.description, panicDetails);
-		dialogState.createPanicDialog(...panicDialog);
+		dialogState.createCrashDialog(panicDetails);
 	});
 }
 
-function preparePanicDialog(header: string, details: string, panicDetails: string): [IconName, WidgetLayout, TextButtonWidget[]] {
-	const headerLabel: TextLabel = { kind: "TextLabel", value: header, disabled: false, bold: true, italic: false, tableAlign: false, minWidth: 0, multiline: false, tooltip: "" };
-	const detailsLabel: TextLabel = { kind: "TextLabel", value: details, disabled: false, bold: false, italic: false, tableAlign: false, minWidth: 0, multiline: true, tooltip: "" };
-
-	const widgets: WidgetLayout = {
-		layout: [{ rowWidgets: [new Widget(headerLabel, 0n)] }, { rowWidgets: [new Widget(detailsLabel, 1n)] }],
-		layoutTarget: undefined,
-	};
-
-	const reloadButton: TextButtonWidget = {
-		callback: async () => window.location.reload(),
-		props: { kind: "TextButton", label: "Reload", emphasized: true, minWidth: 96 },
-	};
-	const copyErrorLogButton: TextButtonWidget = {
-		callback: async () => navigator.clipboard.writeText(panicDetails),
-		props: { kind: "TextButton", label: "Copy Error Log", emphasized: false, minWidth: 96 },
-	};
-	const reportOnGithubButton: TextButtonWidget = {
-		callback: async () => window.open(githubUrl(panicDetails), "_blank"),
-		props: { kind: "TextButton", label: "Report Bug", emphasized: false, minWidth: 96 },
-	};
-	const clearPersistedDataButton: TextButtonWidget = {
-		callback: async () => {
-			await wipeDocuments();
-			window.location.reload();
-		},
-		props: { kind: "TextButton", label: "Clear Saved Data", emphasized: false, minWidth: 96 },
-	};
-	const jsCallbackBasedButtons = [reloadButton, copyErrorLogButton, reportOnGithubButton, clearPersistedDataButton];
-
-	return ["Warning", widgets, jsCallbackBasedButtons];
-}
-
-function githubUrl(panicDetails: string): string {
+export function githubUrl(panicDetails: string): string {
 	const url = new URL("https://github.com/GraphiteEditor/Graphite/issues/new");
 
-	let body = stripIndents`
-		**Describe the Crash**
-		Explain clearly what you were doing when the crash occurred.
+	const buildUrl = (includeCrashReport: boolean) => {
+		let body = stripIndents`
+			**Describe the Crash**
+			Explain clearly what you were doing when the crash occurred.
 
-		**Steps To Reproduce**
-		Describe precisely how the crash occurred, step by step, starting with a new editor window.
-		1. Open the Graphite Editor at https://editor.graphite.rs
-		2. 
-		3. 
-		4. 
-		5. 
+			**Steps To Reproduce**
+			Describe precisely how the crash occurred, step by step, starting with a new editor window.
+			1. Open the Graphite editor at https://editor.graphite.rs
+			2. 
+			3. 
+			4. 
+			5. 
 
-		**Additional Details**
-		Provide any further information or context that you think would be helpful in fixing the issue. Screenshots or video can be linked or attached to this issue.
+			**Additional Details**
+			Provide any further information or context that you think would be helpful in fixing the issue. Screenshots or video can be linked or attached to this issue.
 
-		**Browser and OS**
-		${browserVersion()}, ${operatingSystem(true).replace("Unknown", "YOUR OPERATING SYSTEM")}
+			**Browser and OS**
+			${browserVersion()}, ${operatingSystem(true).replace("Unknown", "YOUR OPERATING SYSTEM")}
 
-		**Stack Trace**
-		Copied from the crash dialog in the Graphite Editor:
-	`;
+			**Stack Trace**
+			Copied from the crash dialog in the Graphite editor:
+		`;
 
-	body += "\n\n```\n";
-	body += panicDetails.trimEnd();
-	body += "\n```";
+		const manualCopyStackTraceNotice = stripIndents`
+			Before submitting this bug, REPLACE THIS WITH THE LOG. Return to the editor and click "Copy Error Log" in the crash dialog and paste it in place of this text.
+		`;
 
-	const fields = {
-		title: "[Crash Report] ",
-		body,
-		labels: ["Crash"].join(","),
-		projects: [].join(","),
-		milestone: "",
-		assignee: "",
-		template: "",
+		body += "\n\n```\n";
+		body += includeCrashReport ? panicDetails.trimEnd() : manualCopyStackTraceNotice;
+		body += "\n```";
+
+		const fields = {
+			title: "[Crash Report] ",
+			body,
+			labels: ["Crash"].join(","),
+			projects: [].join(","),
+			milestone: "",
+			assignee: "",
+			template: "",
+		};
+
+		Object.entries(fields).forEach(([field, value]) => {
+			if (value) url.searchParams.set(field, value);
+		});
+
+		return url.toString();
 	};
 
-	Object.entries(fields).forEach(([field, value]) => {
-		if (value) url.searchParams.set(field, value);
-	});
-
-	return url.toString();
+	let urlString = buildUrl(true);
+	if (urlString.length >= 8192) {
+		// Fall back to a shorter version if it exceeds GitHub limits of 8192 total characters
+		urlString = buildUrl(false);
+	}
+	return urlString;
 }

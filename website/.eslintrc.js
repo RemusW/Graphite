@@ -38,7 +38,7 @@ module.exports = {
 		camelcase: ["error", { properties: "always" }],
 		"linebreak-style": ["error", "unix"],
 		"eol-last": ["error", "always"],
-		"max-len": ["error", { code: 200, tabWidth: 4 }],
+		"max-len": ["error", { code: 200, tabWidth: 4, ignorePattern: `d="([\\s\\S]*?)"` }],
 		"prefer-destructuring": "off",
 		"no-console": "warn",
 		"no-debugger": "warn",
@@ -46,7 +46,7 @@ module.exports = {
 		"no-bitwise": "off",
 		"no-shadow": "off",
 		"no-use-before-define": "off",
-		"no-restricted-imports": ["error", { patterns: [".*", "!@/*"] }],
+		"no-restricted-imports": ["error", { patterns: [".*", "!@graphite/*"] }],
 
 		// Import plugin config (used to intelligently validate module import statements)
 		"import/prefer-default-export": "off",

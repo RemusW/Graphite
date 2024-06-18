@@ -1,49 +1,44 @@
-use crate::messages::layout::utility_types::layout_widget::{Layout, LayoutGroup, PropertyHolder, Widget, WidgetCallback, WidgetHolder, WidgetLayout};
-use crate::messages::layout::utility_types::widgets::button_widgets::TextButton;
-use crate::messages::layout::utility_types::widgets::label_widgets::TextLabel;
+use crate::messages::layout::utility_types::widget_prelude::*;
 use crate::messages::prelude::*;
 
-/// A dialog for confirming the closing of all documents viewable via `file -> close all` in the menu bar.
-pub struct CloseAllDocumentsDialog;
+/// A dialog for confirming the closing of all documents viewable via `File -> Close All` in the menu bar.
+pub struct CloseAllDocumentsDialog {
+	pub unsaved_document_names: Vec<String>,
+}
 
-impl PropertyHolder for CloseAllDocumentsDialog {
-	fn properties(&self) -> Layout {
-		let button_widgets = vec![
-			WidgetHolder::new(Widget::TextButton(TextButton {
-				label: "Discard All".to_string(),
-				min_width: 96,
-				on_update: WidgetCallback::new(|_| {
+impl DialogLayoutHolder for CloseAllDocumentsDialog {
+	const ICON: &'static str = "Warning";
+	const TITLE: &'static str = "Closing All Documents";
+
+	fn layout_buttons(&self) -> Layout {
+		let widgets = vec![
+			TextButton::new("Discard All")
+				.emphasized(true)
+				.on_update(|_| {
 					DialogMessage::CloseDialogAndThen {
 						followups: vec![PortfolioMessage::CloseAllDocuments.into()],
 					}
 					.into()
-				}),
-				..Default::default()
-			})),
-			WidgetHolder::new(Widget::TextButton(TextButton {
-				label: "Cancel".to_string(),
-				min_width: 96,
-				on_update: WidgetCallback::new(|_| FrontendMessage::DisplayDialogDismiss.into()),
-				..Default::default()
-			})),
+				})
+				.widget_holder(),
+			TextButton::new("Cancel").on_update(|_| FrontendMessage::DisplayDialogDismiss.into()).widget_holder(),
 		];
+
+		Layout::WidgetLayout(WidgetLayout::new(vec![LayoutGroup::Row { widgets }]))
+	}
+}
+
+impl LayoutHolder for CloseAllDocumentsDialog {
+	fn layout(&self) -> Layout {
+		let unsaved_list = "• ".to_string() + &self.unsaved_document_names.join("\n• ");
 
 		Layout::WidgetLayout(WidgetLayout::new(vec![
 			LayoutGroup::Row {
-				widgets: vec![WidgetHolder::new(Widget::TextLabel(TextLabel {
-					value: "Close all documents?".to_string(),
-					bold: true,
-					..Default::default()
-				}))],
+				widgets: vec![TextLabel::new("Save documents before closing them?").bold(true).multiline(true).widget_holder()],
 			},
 			LayoutGroup::Row {
-				widgets: vec![WidgetHolder::new(Widget::TextLabel(TextLabel {
-					value: "Unsaved work will be lost!".to_string(),
-					multiline: true,
-					..Default::default()
-				}))],
+				widgets: vec![TextLabel::new(format!("Documents with unsaved changes:\n{unsaved_list}")).multiline(true).widget_holder()],
 			},
-			LayoutGroup::Row { widgets: button_widgets },
 		]))
 	}
 }

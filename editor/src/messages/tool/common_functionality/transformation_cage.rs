@@ -1,15 +1,20 @@
-use crate::application::generate_uuid;
-use crate::consts::{BOUNDS_ROTATE_THRESHOLD, BOUNDS_SELECT_THRESHOLD, COLOR_ACCENT, MANIPULATOR_GROUP_MARKER_SIZE, SELECTION_DRAG_ANGLE};
+use crate::consts::{BOUNDS_ROTATE_THRESHOLD, BOUNDS_SELECT_THRESHOLD, SELECTION_DRAG_ANGLE};
 use crate::messages::frontend::utility_types::MouseCursorIcon;
+use crate::messages::portfolio::document::overlays::utility_types::OverlayContext;
 use crate::messages::portfolio::document::utility_types::transformation::OriginalTransforms;
 use crate::messages::prelude::*;
 
-use graphene::color::Color;
-use graphene::layers::style::{self, Fill, Stroke};
-use graphene::LayerId;
-use graphene::Operation;
+use graphene_core::renderer::Quad;
 
 use glam::{DAffine2, DVec2};
+
+use super::snapping::{self, SnapCandidatePoint, SnapConstraint, SnapData, SnapManager, SnappedPoint};
+
+pub struct SizeSnapData<'a> {
+	pub manager: &'a mut SnapManager,
+	pub points: &'a mut Vec<SnapCandidatePoint>,
+	pub snap_data: SnapData<'a>,
+}
 
 /// Contains the edges that are being dragged along with the original bounds.
 #[derive(Clone, Debug, Default)]
@@ -63,7 +68,7 @@ impl SelectedEdges {
 	}
 
 	/// Computes the new bounds with the given mouse move and modifier keys
-	pub fn new_size(&self, mouse: DVec2, transform: DAffine2, center: bool, center_around: DVec2, constrain: bool) -> (DVec2, DVec2) {
+	pub fn new_size(&self, mouse: DVec2, transform: DAffine2, center_around: Option<DVec2>, constrain: bool, snap: Option<SizeSnapData>) -> (DVec2, DVec2) {
 		let mouse = transform.inverse().transform_point2(mouse);
 
 		let mut min = self.bounds[0];
@@ -80,34 +85,21 @@ impl SelectedEdges {
 		}
 
 		let mut pivot = self.pivot_from_bounds(min, max);
-		if center {
-			// The below ratio is: `dragging edge / being centred`.
-			// The `is_finite()` checks are in case the user is dragging the edge where the pivot is located (in which case the centering mode is ignored).
+		if let Some(center_around) = center_around {
+			let center_around = transform.inverse().transform_point2(center_around);
 			if self.top {
-				let ratio = (center_around.y - min.y) / (center_around.y - self.bounds[0].y);
-				if ratio.is_finite() {
-					max.y = center_around.y + ratio * (self.bounds[1].y - center_around.y);
-					pivot.y = center_around.y;
-				}
+				pivot.y = center_around.y;
+				max.y = center_around.y * 2. - min.y;
 			} else if self.bottom {
-				let ratio = (max.y - center_around.y) / (self.bounds[1].y - center_around.y);
-				if ratio.is_finite() {
-					min.y = center_around.y - ratio * (center_around.y - self.bounds[0].y);
-					pivot.y = center_around.y;
-				}
+				pivot.y = center_around.y;
+				min.y = center_around.y * 2. - max.y;
 			}
 			if self.left {
-				let ratio = (center_around.x - min.x) / (center_around.x - self.bounds[0].x);
-				if ratio.is_finite() {
-					max.x = center_around.x + ratio * (self.bounds[1].x - center_around.x);
-					pivot.x = center_around.x;
-				}
+				pivot.x = center_around.x;
+				max.x = center_around.x * 2. - min.x;
 			} else if self.right {
-				let ratio = (max.x - center_around.x) / (self.bounds[1].x - center_around.x);
-				if ratio.is_finite() {
-					min.x = center_around.x - ratio * (center_around.x - self.bounds[0].x);
-					pivot.x = center_around.x;
-				}
+				pivot.x = center_around.x;
+				min.x = center_around.x * 2. - max.x;
 			}
 		}
 
@@ -123,6 +115,64 @@ impl SelectedEdges {
 			let delta_size = new_size - size;
 			min -= delta_size * min_pivot;
 			max = min + new_size;
+		}
+
+		if let Some(SizeSnapData { manager, points, snap_data }) = snap {
+			let view_to_doc = snap_data.document.metadata.document_to_viewport.inverse();
+			let bounds_to_doc = view_to_doc * transform;
+			let mut best_snap = SnappedPoint::infinite_snap(pivot);
+			let mut best_scale_factor = DVec2::ONE;
+			let tolerance = snapping::snap_tolerance(snap_data.document);
+			for point in points {
+				let old_position = point.document_point;
+				let bounds_space = bounds_to_doc.inverse().transform_point2(point.document_point);
+				let normalised = (bounds_space - self.bounds[0]) / (self.bounds[1] - self.bounds[0]);
+				let updated = normalised * (max - min) + min;
+				point.document_point = bounds_to_doc.transform_point2(updated);
+				let mut snapped = if constrain {
+					let constraint = SnapConstraint::Line {
+						origin: point.document_point,
+						direction: (point.document_point - bounds_to_doc.transform_point2(pivot)).normalize_or_zero(),
+					};
+					manager.constrained_snap(&snap_data, point, constraint, None)
+				} else if !(self.top || self.bottom) || !(self.left || self.right) {
+					let axis = if !(self.top || self.bottom) { DVec2::X } else { DVec2::Y };
+					let constraint = SnapConstraint::Line {
+						origin: point.document_point,
+						direction: bounds_to_doc.transform_vector2(axis),
+					};
+					manager.constrained_snap(&snap_data, point, constraint, None)
+				} else {
+					manager.free_snap(&snap_data, point, None, false)
+				};
+				point.document_point = old_position;
+
+				if !snapped.is_snapped() {
+					continue;
+				}
+				let snapped_bounds = bounds_to_doc.inverse().transform_point2(snapped.snapped_point_document);
+
+				let mut scale_factor = (snapped_bounds - pivot) / (updated - pivot);
+				if !(self.left || self.right || constrain) {
+					scale_factor.x = 1.
+				}
+				if !(self.top || self.bottom || constrain) {
+					scale_factor.y = 1.
+				}
+
+				snapped.distance = bounds_to_doc.transform_vector2((max - min) * (scale_factor - DVec2::ONE)).length();
+				if snapped.distance > tolerance || !snapped.distance.is_finite() {
+					continue;
+				}
+				if best_snap.other_snap_better(&snapped) {
+					best_snap = snapped;
+					best_scale_factor = scale_factor;
+				}
+			}
+			manager.update_indicator(best_snap);
+
+			min = pivot - (pivot - min) * best_scale_factor;
+			max = pivot - (pivot - max) * best_scale_factor;
 		}
 
 		(min, max - min)
@@ -149,54 +199,6 @@ impl SelectedEdges {
 	}
 }
 
-/// Create a viewport relative bounding box overlay with no transform handles
-pub fn add_bounding_box(responses: &mut VecDeque<Message>) -> Vec<LayerId> {
-	let path = vec![generate_uuid()];
-
-	let operation = Operation::AddRect {
-		path: path.clone(),
-		transform: DAffine2::ZERO.to_cols_array(),
-		style: style::PathStyle::new(Some(Stroke::new(COLOR_ACCENT, 1.0)), Fill::None),
-		insert_index: -1,
-	};
-	responses.push_back(DocumentMessage::Overlays(operation.into()).into());
-
-	path
-}
-
-/// Add the transform handle overlay
-fn add_transform_handles(responses: &mut VecDeque<Message>) -> [Vec<LayerId>; 8] {
-	const EMPTY_VEC: Vec<LayerId> = Vec::new();
-	let mut transform_handle_paths = [EMPTY_VEC; 8];
-
-	for item in &mut transform_handle_paths {
-		let current_path = vec![generate_uuid()];
-
-		let operation = Operation::AddRect {
-			path: current_path.clone(),
-			transform: DAffine2::ZERO.to_cols_array(),
-			style: style::PathStyle::new(Some(Stroke::new(COLOR_ACCENT, 2.0)), Fill::solid(Color::WHITE)),
-			insert_index: -1,
-		};
-		responses.push_back(DocumentMessage::Overlays(operation.into()).into());
-
-		*item = current_path;
-	}
-
-	transform_handle_paths
-}
-
-/// Converts a bounding box to a rounded transform (with translation and scale)
-pub fn transform_from_box(pos1: DVec2, pos2: DVec2, transform: DAffine2) -> DAffine2 {
-	let inverse = transform.inverse();
-	transform
-		* DAffine2::from_scale_angle_translation(
-			inverse.transform_vector2(transform.transform_vector2(pos2 - pos1).round()),
-			0.,
-			inverse.transform_point2(transform.transform_point2(pos1).round() - DVec2::splat(0.5)),
-		)
-}
-
 /// Aligns the mouse position to the closest axis
 pub fn axis_align_drag(axis_align: bool, position: DVec2, start: DVec2) -> DVec2 {
 	if axis_align {
@@ -204,7 +206,11 @@ pub fn axis_align_drag(axis_align: bool, position: DVec2, start: DVec2) -> DVec2
 		let snap_resolution = SELECTION_DRAG_ANGLE.to_radians();
 		let angle = -mouse_position.angle_between(DVec2::X);
 		let snapped_angle = (angle / snap_resolution).round() * snap_resolution;
-		DVec2::new(snapped_angle.cos(), snapped_angle.sin()) * mouse_position.length() + start
+		if snapped_angle.is_finite() {
+			start + DVec2::new(snapped_angle.cos(), snapped_angle.sin()) * mouse_position.length()
+		} else {
+			start
+		}
 	} else {
 		position
 	}
@@ -212,27 +218,17 @@ pub fn axis_align_drag(axis_align: bool, position: DVec2, start: DVec2) -> DVec2
 
 /// Contains info on the overlays for the bounding box and transform handles
 #[derive(Clone, Debug, Default)]
-pub struct BoundingBoxOverlays {
-	pub bounding_box: Vec<LayerId>,
-	pub transform_handles: [Vec<LayerId>; 8],
+pub struct BoundingBoxManager {
 	pub bounds: [DVec2; 2],
 	pub transform: DAffine2,
+	pub original_bound_transform: DAffine2,
 	pub selected_edges: Option<SelectedEdges>,
 	pub original_transforms: OriginalTransforms,
 	pub opposite_pivot: DVec2,
 	pub center_of_transformation: DVec2,
 }
 
-impl BoundingBoxOverlays {
-	#[must_use]
-	pub fn new(responses: &mut VecDeque<Message>) -> Self {
-		Self {
-			bounding_box: add_bounding_box(responses),
-			transform_handles: add_transform_handles(responses),
-			..Default::default()
-		}
-	}
-
+impl BoundingBoxManager {
 	/// Calculates the transformed handle positions based on the bounding box and the transform
 	pub fn evaluate_transform_handle_positions(&self) -> [DVec2; 8] {
 		let (left, top): (f64, f64) = self.bounds[0].into();
@@ -250,20 +246,11 @@ impl BoundingBoxOverlays {
 	}
 
 	/// Update the position of the bounding box and transform handles
-	pub fn transform(&mut self, responses: &mut VecDeque<Message>) {
-		let transform = transform_from_box(self.bounds[0], self.bounds[1], self.transform).to_cols_array();
-		let path = self.bounding_box.clone();
-		responses.push_back(DocumentMessage::Overlays(Operation::SetLayerTransformInViewport { path, transform }.into()).into());
+	pub fn render_overlays(&mut self, overlay_context: &mut OverlayContext) {
+		overlay_context.quad(self.transform * Quad::from_box(self.bounds));
 
-		// Helps push values that end in approximately half, plus or minus some floating point imprecision, towards the same side of the round() function
-		const BIAS: f64 = 0.0001;
-
-		for (position, path) in self.evaluate_transform_handle_positions().into_iter().zip(&self.transform_handles) {
-			let scale = DVec2::splat(MANIPULATOR_GROUP_MARKER_SIZE);
-			let translation = (position - (scale / 2.) - 0.5 + BIAS).round();
-			let transform = DAffine2::from_scale_angle_translation(scale, 0., translation).to_cols_array();
-			let path = path.clone();
-			responses.push_back(DocumentMessage::Overlays(Operation::SetLayerTransformInViewport { path, transform }.into()).into());
+		for position in self.evaluate_transform_handle_positions() {
+			overlay_context.square(position, Some(6.), None, None);
 		}
 	}
 
@@ -337,15 +324,5 @@ impl BoundingBoxOverlays {
 		} else {
 			MouseCursorIcon::Default
 		}
-	}
-
-	/// Removes the overlays
-	pub fn delete(self, responses: &mut VecDeque<Message>) {
-		responses.push_back(DocumentMessage::Overlays(Operation::DeleteLayer { path: self.bounding_box }.into()).into());
-		responses.extend(
-			self.transform_handles
-				.iter()
-				.map(|path| DocumentMessage::Overlays(Operation::DeleteLayer { path: path.clone() }.into()).into()),
-		);
 	}
 }

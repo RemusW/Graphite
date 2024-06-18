@@ -1,0 +1,25 @@
+.code-contributions,
+.creative-contributions {
+	gap: 0 calc(80* var(--variable-px));
+}
+
+.code-contributions .info-box {
+	background-color: var(--color-seaside);
+}
+
+.creative-contributions .info-box {
+	background-color: var(--color-lemon);
+}
+
+.info-box {
+	margin-top: calc(40 * var(--variable-px));
+
+	> img:first-child,
+	> a:first-child > img:only-child {
+		width: calc(100% + 2 * 80 * var(--variable-px));
+		margin-left: calc(-80 * var(--variable-px));
+		margin-top: calc(-80 * var(--variable-px));
+		margin-bottom: calc(40 * var(--variable-px));
+		display: block;
+	}
+}

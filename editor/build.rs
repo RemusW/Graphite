@@ -1,6 +1,6 @@
 use std::process::Command;
 
-const GRAPHITE_RELEASE_SERIES: &str = "Alpha Milestone 1";
+const GRAPHITE_RELEASE_SERIES: &str = "Alpha 3";
 
 fn main() {
 	// Execute a Git command for its stdout. Early exit if it fails for any of the possible reasons.
@@ -17,6 +17,8 @@ fn main() {
 	// They are accessed with the `env!("...")` macro in the codebase.
 	println!("cargo:rustc-env=GRAPHITE_GIT_COMMIT_DATE={}", git_command(&["log", "-1", "--format=%cd"]));
 	println!("cargo:rustc-env=GRAPHITE_GIT_COMMIT_HASH={}", git_command(&["rev-parse", "HEAD"]));
-	println!("cargo:rustc-env=GRAPHITE_GIT_COMMIT_BRANCH={}", git_command(&["rev-parse", "--abbrev-ref", "HEAD"]));
-	println!("cargo:rustc-env=GRAPHITE_RELEASE_SERIES={}", GRAPHITE_RELEASE_SERIES);
+	let branch = std::env::var("GITHUB_HEAD_REF").unwrap_or_default();
+	let branch = if branch.is_empty() { git_command(&["name-rev", "--name-only", "HEAD"]) } else { branch };
+	println!("cargo:rustc-env=GRAPHITE_GIT_COMMIT_BRANCH={branch}");
+	println!("cargo:rustc-env=GRAPHITE_RELEASE_SERIES={GRAPHITE_RELEASE_SERIES}");
 }

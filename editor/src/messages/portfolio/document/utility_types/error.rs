@@ -1,5 +1,4 @@
-use graphene::color::Color;
-use graphene::DocumentError;
+use graphene_core::raster::color::Color;
 
 use thiserror::Error;
 
@@ -18,8 +17,8 @@ pub enum EditorError {
 	#[error("The operation caused a document error:\n{0:?}")]
 	Document(String),
 
-	#[error("A rollback was initiated but no transaction was in progress")]
-	NoTransactionInProgress,
+	#[error("This document was created in an older version of the editor.\n\nBackwards compatibility is, regrettably, not present in the current alpha release.\n\nTechnical details:\n{0:?}")]
+	DocumentDeserialization(String),
 
 	#[error("{0}")]
 	Misc(String),
@@ -29,7 +28,7 @@ macro_rules! derive_from {
 	($type:ty, $kind:ident) => {
 		impl From<$type> for EditorError {
 			fn from(error: $type) -> Self {
-				EditorError::$kind(format!("{:?}", error))
+				EditorError::$kind(format!("{error:?}"))
 			}
 		}
 	};
@@ -38,4 +37,3 @@ macro_rules! derive_from {
 derive_from!(&str, Misc);
 derive_from!(String, Misc);
 derive_from!(Color, Color);
-derive_from!(DocumentError, Document);

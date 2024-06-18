@@ -1,22 +1,21 @@
+use super::tool_prelude::*;
 use crate::consts::LINE_ROTATE_SNAP_ANGLE;
-use crate::messages::frontend::utility_types::MouseCursorIcon;
-use crate::messages::input_mapper::utility_types::input_keyboard::{Key, KeysGroup, MouseMotion};
-use crate::messages::layout::utility_types::layout_widget::{Layout, LayoutGroup, PropertyHolder, Widget, WidgetCallback, WidgetHolder, WidgetLayout};
-use crate::messages::layout::utility_types::widgets::input_widgets::NumberInput;
-use crate::messages::prelude::*;
-use crate::messages::tool::common_functionality::overlay_renderer::OverlayRenderer;
-use crate::messages::tool::common_functionality::snapping::SnapManager;
-use crate::messages::tool::utility_types::{EventToMessageMap, Fsm, ToolActionHandlerData, ToolMetadata, ToolTransition, ToolType};
-use crate::messages::tool::utility_types::{HintData, HintGroup, HintInfo};
+use crate::messages::portfolio::document::graph_operation::utility_types::VectorDataModification;
+use crate::messages::portfolio::document::overlays::utility_functions::path_overlays;
+use crate::messages::portfolio::document::overlays::utility_types::OverlayContext;
+use crate::messages::portfolio::document::utility_types::document_metadata::LayerNodeIdentifier;
+use crate::messages::tool::common_functionality::auto_panning::AutoPanning;
+use crate::messages::tool::common_functionality::color_selector::{ToolColorOptions, ToolColorType};
+use crate::messages::tool::common_functionality::graph_modification_utils;
+use crate::messages::tool::common_functionality::graph_modification_utils::get_subpaths;
+use crate::messages::tool::common_functionality::snapping::{SnapCandidatePoint, SnapConstraint, SnapData, SnapManager};
+use crate::messages::tool::common_functionality::utility_functions::should_extend;
 
-use graphene::layers::style;
-use graphene::LayerId;
-use graphene::Operation;
-use graphene_std::vector::consts::ManipulatorType;
-use graphene_std::vector::manipulator_group::ManipulatorGroup;
-
-use glam::{DAffine2, DVec2};
-use serde::{Deserialize, Serialize};
+use graph_craft::document::NodeId;
+use graphene_core::uuid::{generate_uuid, ManipulatorGroupId};
+use graphene_core::vector::style::{Fill, Stroke};
+use graphene_core::vector::{ManipulatorPointId, SelectedType};
+use graphene_core::Color;
 
 #[derive(Default)]
 pub struct PenTool {
@@ -27,49 +26,56 @@ pub struct PenTool {
 
 pub struct PenOptions {
 	line_weight: f64,
+	fill: ToolColorOptions,
+	stroke: ToolColorOptions,
 }
 
 impl Default for PenOptions {
 	fn default() -> Self {
-		Self { line_weight: 5. }
+		Self {
+			line_weight: 5.,
+			fill: ToolColorOptions::new_secondary(),
+			stroke: ToolColorOptions::new_primary(),
+		}
 	}
 }
 
-#[remain::sorted]
 #[impl_message(Message, ToolMessage, Pen)]
-#[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]
 pub enum PenToolMessage {
 	// Standard messages
-	#[remain::unsorted]
-	DocumentIsDirty,
-	#[remain::unsorted]
 	Abort,
-	#[remain::unsorted]
 	SelectionChanged,
+	WorkingColorChanged,
+	Overlays(OverlayContext),
 
 	// Tool-specific messages
 	Confirm,
 	DragStart,
 	DragStop,
-	PointerMove {
-		snap_angle: Key,
-		break_handle: Key,
-	},
+	PointerMove { snap_angle: Key, break_handle: Key, lock_angle: Key },
+	PointerOutsideViewport { snap_angle: Key, break_handle: Key, lock_angle: Key },
+	Redo,
 	Undo,
 	UpdateOptions(PenOptionsUpdate),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum PenToolFsmState {
+	#[default]
 	Ready,
 	DraggingHandle,
 	PlacingAnchor,
 }
 
-#[remain::sorted]
-#[derive(PartialEq, Clone, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]
 pub enum PenOptionsUpdate {
+	FillColor(Option<Color>),
+	FillColorType(ToolColorType),
 	LineWeight(f64),
+	StrokeColor(Option<Color>),
+	StrokeColorType(ToolColorType),
+	WorkingColors(Option<Color>, Option<Color>),
 }
 
 impl ToolMetadata for PenTool {
@@ -84,48 +90,69 @@ impl ToolMetadata for PenTool {
 	}
 }
 
-impl PropertyHolder for PenTool {
-	fn properties(&self) -> Layout {
-		Layout::WidgetLayout(WidgetLayout::new(vec![LayoutGroup::Row {
-			widgets: vec![WidgetHolder::new(Widget::NumberInput(NumberInput {
-				unit: " px".into(),
-				label: "Weight".into(),
-				value: Some(self.options.line_weight),
-				is_integer: false,
-				min: Some(0.),
-				on_update: WidgetCallback::new(|number_input: &NumberInput| PenToolMessage::UpdateOptions(PenOptionsUpdate::LineWeight(number_input.value.unwrap())).into()),
-				..NumberInput::default()
-			}))],
-		}]))
+fn create_weight_widget(line_weight: f64) -> WidgetHolder {
+	NumberInput::new(Some(line_weight))
+		.unit(" px")
+		.label("Weight")
+		.min(0.)
+		.max((1_u64 << std::f64::MANTISSA_DIGITS) as f64)
+		.on_update(|number_input: &NumberInput| PenToolMessage::UpdateOptions(PenOptionsUpdate::LineWeight(number_input.value.unwrap())).into())
+		.widget_holder()
+}
+
+impl LayoutHolder for PenTool {
+	fn layout(&self) -> Layout {
+		let mut widgets = self.options.fill.create_widgets(
+			"Fill",
+			true,
+			|_| PenToolMessage::UpdateOptions(PenOptionsUpdate::FillColor(None)).into(),
+			|color_type: ToolColorType| WidgetCallback::new(move |_| PenToolMessage::UpdateOptions(PenOptionsUpdate::FillColorType(color_type.clone())).into()),
+			|color: &ColorButton| PenToolMessage::UpdateOptions(PenOptionsUpdate::FillColor(color.value.as_solid())).into(),
+		);
+
+		widgets.push(Separator::new(SeparatorType::Unrelated).widget_holder());
+
+		widgets.append(&mut self.options.stroke.create_widgets(
+			"Stroke",
+			true,
+			|_| PenToolMessage::UpdateOptions(PenOptionsUpdate::StrokeColor(None)).into(),
+			|color_type: ToolColorType| WidgetCallback::new(move |_| PenToolMessage::UpdateOptions(PenOptionsUpdate::StrokeColorType(color_type.clone())).into()),
+			|color: &ColorButton| PenToolMessage::UpdateOptions(PenOptionsUpdate::StrokeColor(color.value.as_solid())).into(),
+		));
+		widgets.push(Separator::new(SeparatorType::Unrelated).widget_holder());
+		widgets.push(create_weight_widget(self.options.line_weight));
+
+		Layout::WidgetLayout(WidgetLayout::new(vec![LayoutGroup::Row { widgets }]))
 	}
 }
 
-impl<'a> MessageHandler<ToolMessage, ToolActionHandlerData<'a>> for PenTool {
-	fn process_message(&mut self, message: ToolMessage, tool_data: ToolActionHandlerData<'a>, responses: &mut VecDeque<Message>) {
-		if message == ToolMessage::UpdateHints {
-			self.fsm_state.update_hints(responses);
+impl<'a> MessageHandler<ToolMessage, &mut ToolActionHandlerData<'a>> for PenTool {
+	fn process_message(&mut self, message: ToolMessage, responses: &mut VecDeque<Message>, tool_data: &mut ToolActionHandlerData<'a>) {
+		let ToolMessage::Pen(PenToolMessage::UpdateOptions(action)) = message else {
+			self.fsm_state.process_event(message, &mut self.tool_data, tool_data, &self.options, responses, true);
 			return;
-		}
-
-		if message == ToolMessage::UpdateCursor {
-			self.fsm_state.update_cursor(responses);
-			return;
-		}
-
-		if let ToolMessage::Pen(PenToolMessage::UpdateOptions(action)) = message {
-			match action {
-				PenOptionsUpdate::LineWeight(line_weight) => self.options.line_weight = line_weight,
+		};
+		match action {
+			PenOptionsUpdate::LineWeight(line_weight) => self.options.line_weight = line_weight,
+			PenOptionsUpdate::FillColor(color) => {
+				self.options.fill.custom_color = color;
+				self.options.fill.color_type = ToolColorType::Custom;
 			}
-			return;
+			PenOptionsUpdate::FillColorType(color_type) => self.options.fill.color_type = color_type,
+			PenOptionsUpdate::StrokeColor(color) => {
+				self.options.stroke.custom_color = color;
+				self.options.stroke.color_type = ToolColorType::Custom;
+			}
+			PenOptionsUpdate::StrokeColorType(color_type) => self.options.stroke.color_type = color_type,
+			PenOptionsUpdate::WorkingColors(primary, secondary) => {
+				self.options.stroke.primary_working_color = primary;
+				self.options.stroke.secondary_working_color = secondary;
+				self.options.fill.primary_working_color = primary;
+				self.options.fill.secondary_working_color = secondary;
+			}
 		}
 
-		let new_state = self.fsm_state.transition(message, &mut self.tool_data, tool_data, &self.options, responses);
-
-		if self.fsm_state != new_state {
-			self.fsm_state = new_state;
-			self.fsm_state.update_hints(responses);
-			self.fsm_state.update_cursor(responses);
-		}
+		self.send_layout(responses, LayoutTarget::ToolOptions);
 	}
 
 	fn actions(&self) -> ActionList {
@@ -136,6 +163,7 @@ impl<'a> MessageHandler<ToolMessage, ToolActionHandlerData<'a>> for PenTool {
 				DragStop,
 				Confirm,
 				Abort,
+				PointerMove,
 			),
 			PenToolFsmState::DraggingHandle | PenToolFsmState::PlacingAnchor => actions!(PenToolMessageDiscriminant;
 				DragStart,
@@ -151,587 +179,637 @@ impl<'a> MessageHandler<ToolMessage, ToolActionHandlerData<'a>> for PenTool {
 impl ToolTransition for PenTool {
 	fn event_to_message_map(&self) -> EventToMessageMap {
 		EventToMessageMap {
-			document_dirty: Some(PenToolMessage::DocumentIsDirty.into()),
 			tool_abort: Some(PenToolMessage::Abort.into()),
 			selection_changed: Some(PenToolMessage::SelectionChanged.into()),
+			working_color_changed: Some(PenToolMessage::WorkingColorChanged.into()),
+			overlay_provider: Some(|overlay_context| PenToolMessage::Overlays(overlay_context).into()),
+			..Default::default()
 		}
 	}
 }
-
-impl Default for PenToolFsmState {
-	fn default() -> Self {
-		PenToolFsmState::Ready
-	}
+#[derive(Default)]
+struct ModifierState {
+	snap_angle: bool,
+	lock_angle: bool,
+	break_handle: bool,
 }
+
 #[derive(Clone, Debug, Default)]
 struct PenToolData {
 	weight: f64,
-	path: Option<Vec<LayerId>>,
-	overlay_renderer: OverlayRenderer,
+	layer: Option<LayerNodeIdentifier>,
+	subpath_index: usize,
 	snap_manager: SnapManager,
-	should_mirror: bool,
+	colinear_handles: bool,
 	// Indicates that curve extension is occurring from the first point, rather than (more commonly) the last point
 	from_start: bool,
+	angle: f64,
+	auto_panning: AutoPanning,
+}
+impl PenToolData {
+	fn extend_subpath(&mut self, layer: LayerNodeIdentifier, subpath_index: usize, from_start: bool, document: &DocumentMessageHandler, responses: &mut VecDeque<Message>) {
+		self.layer = Some(layer);
+		self.from_start = from_start;
+		self.subpath_index = subpath_index;
+
+		let Some(subpaths) = get_subpaths(layer, &document.network) else { return };
+		let manipulator_groups = subpaths[subpath_index].manipulator_groups();
+		let first_or_last = if from_start { manipulator_groups.first() } else { manipulator_groups.last() };
+		let Some(last_handle) = first_or_last else { return };
+		let id = last_handle.id;
+		let modification = VectorDataModification::SetManipulatorColinearHandlesState { id, colinear: false };
+
+		// Stop the handles on the first point from being colinear
+		responses.add(GraphOperationMessage::Vector { layer, modification });
+	}
+
+	fn create_new_path(
+		&mut self,
+		document: &DocumentMessageHandler,
+		line_weight: f64,
+		stroke_color: Option<Color>,
+		fill_color: Option<Color>,
+		input: &InputPreprocessorMessageHandler,
+		responses: &mut VecDeque<Message>,
+	) {
+		let parent = document.new_layer_parent(true);
+		// Deselect layers because we are now creating a new layer
+		responses.add(DocumentMessage::DeselectAllLayers);
+
+		// Get the position and set properties
+		let transform = document.metadata().transform_to_document(parent);
+		let point = SnapCandidatePoint::handle(document.metadata.document_to_viewport.inverse().transform_point2(input.mouse.position));
+		let snapped = self.snap_manager.free_snap(&SnapData::new(document, input), &point, None, false);
+		let start_position = transform.inverse().transform_point2(snapped.snapped_point_document);
+		self.snap_manager.update_indicator(snapped);
+		self.weight = line_weight;
+
+		// Create the initial shape with a `bez_path` (only contains a moveto initially)
+		let subpath = bezier_rs::Subpath::new(vec![bezier_rs::ManipulatorGroup::new(start_position, Some(start_position), Some(start_position))], false);
+		let layer = graph_modification_utils::new_vector_layer(vec![subpath], NodeId(generate_uuid()), parent, responses);
+		self.layer = Some(layer);
+
+		responses.add(GraphOperationMessage::FillSet {
+			layer,
+			fill: if let Some(color) = fill_color { Fill::Solid(color) } else { Fill::None },
+		});
+
+		responses.add(GraphOperationMessage::StrokeSet {
+			layer,
+			stroke: Stroke::new(stroke_color, line_weight),
+		});
+
+		self.from_start = false;
+		self.subpath_index = 0;
+	}
+
+	/// If the user places the anchor on top of the previous anchor, it becomes sharp and the outgoing handle may be dragged.
+	fn bend_from_previous_point(&mut self, document: &DocumentMessageHandler, transform: DAffine2, responses: &mut VecDeque<Message>) {
+		(|| -> Option<()> {
+			// Get subpath
+			let layer = self.layer?;
+			let subpath = &get_subpaths(layer, &document.network)?[self.subpath_index];
+
+			// Get the last manipulator group and the one previous to that
+			let mut manipulator_groups = subpath.manipulator_groups().iter();
+			let last_manipulator_group = if self.from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
+			let previous_manipulator_group = if self.from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
+
+			// Get correct handle types
+			let outwards_handle = if self.from_start { SelectedType::InHandle } else { SelectedType::OutHandle };
+
+			// Get manipulator points
+			let last_anchor = last_manipulator_group.anchor;
+			let previous_anchor = previous_manipulator_group.anchor;
+
+			// Break the control
+			let transform = document.metadata.document_to_viewport * transform;
+			let on_top = transform.transform_point2(last_anchor).distance_squared(transform.transform_point2(previous_anchor)) < crate::consts::SNAP_POINT_TOLERANCE.powi(2);
+			if !on_top {
+				return None;
+			}
+
+			// Remove the point that has just been placed
+			responses.add(GraphOperationMessage::Vector {
+				layer,
+				modification: VectorDataModification::RemoveManipulatorGroup { id: last_manipulator_group.id },
+			});
+
+			// Move the in handle of the previous anchor to on top of the previous position
+			let point = ManipulatorPointId::new(previous_manipulator_group.id, outwards_handle);
+			responses.add(GraphOperationMessage::Vector {
+				layer,
+				modification: VectorDataModification::SetManipulatorPosition { point, position: previous_anchor },
+			});
+
+			// Stop the handles on the last point from being colinear
+			let id = previous_manipulator_group.id;
+			responses.add(GraphOperationMessage::Vector {
+				layer,
+				modification: VectorDataModification::SetManipulatorColinearHandlesState { id, colinear: false },
+			});
+
+			self.colinear_handles = false;
+
+			None
+		})();
+	}
+
+	fn finish_placing_handle(&mut self, document: &DocumentMessageHandler, transform: DAffine2, responses: &mut VecDeque<Message>) -> Option<PenToolFsmState> {
+		// Get subpath
+		let layer = self.layer?;
+		let subpath = &get_subpaths(layer, &document.network)?[self.subpath_index];
+
+		// Get the last manipulator group and the one previous to that
+		let mut manipulator_groups = subpath.manipulator_groups().iter();
+		let last_manipulator_group = if self.from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
+		let previous_manipulator_group = if self.from_start { manipulator_groups.next() } else { manipulator_groups.next_back() };
+
+		// Get the first manipulator group
+		let first_manipulator_group = if self.from_start {
+			subpath.manipulator_groups().last()?
+		} else {
+			subpath.manipulator_groups().first()?
+		};
+
+		// Get correct handle types
+		let inwards_handle = if self.from_start { SelectedType::OutHandle } else { SelectedType::InHandle };
+		let outwards_handle = if self.from_start { SelectedType::InHandle } else { SelectedType::OutHandle };
+
+		// Get manipulator points
+		let last_anchor = last_manipulator_group.anchor;
+		let first_anchor = first_manipulator_group.anchor;
+		let last_in = inwards_handle.get_position(last_manipulator_group)?;
+
+		let transform = document.metadata.document_to_viewport * transform;
+		let transformed_distance_between_squared = transform.transform_point2(last_anchor).distance_squared(transform.transform_point2(first_anchor));
+		let snap_point_tolerance_squared = crate::consts::SNAP_POINT_TOLERANCE.powi(2);
+		let should_close_path = transformed_distance_between_squared < snap_point_tolerance_squared && previous_manipulator_group.is_some();
+		if should_close_path {
+			// Move the in handle of the first point to where the user has placed it
+			let point = ManipulatorPointId::new(first_manipulator_group.id, inwards_handle);
+			responses.add(GraphOperationMessage::Vector {
+				layer,
+				modification: VectorDataModification::SetManipulatorPosition { point, position: last_in },
+			});
+
+			// Stop the handles on the first point from being colinear
+			let id = first_manipulator_group.id;
+			responses.add(GraphOperationMessage::Vector {
+				layer,
+				modification: VectorDataModification::SetManipulatorColinearHandlesState { id, colinear: false },
+			});
+
+			// Remove the point that has just been placed
+			responses.add(GraphOperationMessage::Vector {
+				layer,
+				modification: VectorDataModification::RemoveManipulatorGroup { id: last_manipulator_group.id },
+			});
+
+			// Push a close path node
+			responses.add(GraphOperationMessage::Vector {
+				layer,
+				modification: VectorDataModification::SetClosed { index: 0, closed: true },
+			});
+
+			responses.add(DocumentMessage::CommitTransaction);
+
+			// Clean up tool data
+			self.layer = None;
+			self.snap_manager.cleanup(responses);
+
+			// Return to ready state
+			return Some(PenToolFsmState::Ready);
+		}
+		// Add a new manipulator for the next anchor that we will place
+		if let Some(out_handle) = outwards_handle.get_position(last_manipulator_group) {
+			responses.add(add_manipulator_group(self.layer, self.from_start, bezier_rs::ManipulatorGroup::new_anchor(out_handle)));
+		}
+
+		Some(PenToolFsmState::PlacingAnchor)
+	}
+
+	fn drag_handle(&mut self, mut snap_data: SnapData, transform: DAffine2, mouse: DVec2, modifiers: ModifierState, responses: &mut VecDeque<Message>) -> Option<PenToolFsmState> {
+		let document = snap_data.document;
+		// Get subpath
+		let subpath = &get_subpaths(self.layer?, &document.network)?[self.subpath_index];
+
+		// Get the last manipulator group
+		let manipulator_groups = subpath.manipulator_groups();
+		let last_manipulator_group = if self.from_start { manipulator_groups.first()? } else { manipulator_groups.last()? };
+
+		// Get correct handle types
+		let inwards_handle = if self.from_start { SelectedType::OutHandle } else { SelectedType::InHandle };
+		let outwards_handle = if self.from_start { SelectedType::InHandle } else { SelectedType::OutHandle };
+
+		// Get manipulator points
+		let last_anchor = last_manipulator_group.anchor;
+
+		let colinear = !modifiers.break_handle && self.colinear_handles;
+
+		snap_data.manipulators = vec![(self.layer?, last_manipulator_group.id)];
+		let position = self.compute_snapped_angle(snap_data, transform, modifiers.lock_angle, modifiers.snap_angle, colinear, mouse, Some(last_anchor), false);
+		if !position.is_finite() {
+			return Some(PenToolFsmState::DraggingHandle);
+		}
+
+		// Update points on current segment (to show preview of new handle)
+		let point = ManipulatorPointId::new(last_manipulator_group.id, outwards_handle);
+		responses.add(GraphOperationMessage::Vector {
+			layer: self.layer?,
+			modification: VectorDataModification::SetManipulatorPosition { point, position },
+		});
+
+		// Place the previous anchor's in handle at the opposing position
+		if colinear {
+			// Could also be written as `last_anchor.position * 2 - pos` but this way avoids overflow/underflow better
+			let position = last_anchor - (position - last_anchor);
+			let point = ManipulatorPointId::new(last_manipulator_group.id, inwards_handle);
+			responses.add(GraphOperationMessage::Vector {
+				layer: self.layer?,
+				modification: VectorDataModification::SetManipulatorPosition { point, position },
+			});
+		}
+
+		// Update the colinear handles status of the currently modifying point
+		let id = last_manipulator_group.id;
+		responses.add(GraphOperationMessage::Vector {
+			layer: self.layer?,
+			modification: VectorDataModification::SetManipulatorColinearHandlesState { id, colinear },
+		});
+
+		Some(PenToolFsmState::DraggingHandle)
+	}
+
+	fn place_anchor(&mut self, mut snap_data: SnapData, transform: DAffine2, mouse: DVec2, modifiers: ModifierState, responses: &mut VecDeque<Message>) -> Option<PenToolFsmState> {
+		let document = snap_data.document;
+		// Get subpath
+		let layer = self.layer?;
+		let subpath = &get_subpaths(layer, &document.network)?[self.subpath_index];
+
+		// Get the last manipulator group and the one previous to that
+		let mut manipulator_groups = subpath.manipulator_groups().iter();
+		let last_manipulator_group = if self.from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
+		let previous_manipulator_group = if self.from_start { manipulator_groups.next() } else { manipulator_groups.next_back() };
+
+		// Get the first manipulator group
+		let manipulator_groups = subpath.manipulator_groups();
+		let first_manipulator_group = if self.from_start { manipulator_groups.last()? } else { manipulator_groups.first()? };
+
+		// Get manipulator points
+		let first_anchor = first_manipulator_group.anchor;
+
+		let previous_anchor = previous_manipulator_group.map(|group| group.anchor);
+
+		let pos = if let Some(last_anchor) = previous_anchor.filter(|&a| mouse.distance_squared(transform.transform_point2(a)) < crate::consts::SNAP_POINT_TOLERANCE.powi(2)) {
+			// Snap to the previously placed point (to show break control)
+			last_anchor
+		} else if mouse.distance_squared(transform.transform_point2(first_anchor)) < crate::consts::SNAP_POINT_TOLERANCE.powi(2) {
+			// Snap to the first point (to show close path)
+			first_anchor
+		} else {
+			snap_data.manipulators = vec![(self.layer?, last_manipulator_group.id)];
+			self.compute_snapped_angle(snap_data, transform, modifiers.lock_angle, modifiers.snap_angle, false, mouse, previous_anchor, true)
+		};
+
+		for manipulator_type in [SelectedType::Anchor, SelectedType::InHandle, SelectedType::OutHandle] {
+			let point = ManipulatorPointId::new(last_manipulator_group.id, manipulator_type);
+			responses.add(GraphOperationMessage::Vector {
+				layer,
+				modification: VectorDataModification::SetManipulatorPosition { point, position: pos },
+			});
+		}
+		Some(PenToolFsmState::PlacingAnchor)
+	}
+
+	/// Snap the angle of the line from relative to position if the key is pressed.
+	fn compute_snapped_angle(&mut self, snap_data: SnapData, transform: DAffine2, lock_angle: bool, snap_angle: bool, colinear: bool, mouse: DVec2, relative: Option<DVec2>, neighbor: bool) -> DVec2 {
+		let document = snap_data.document;
+		let mut document_pos = document.metadata.document_to_viewport.inverse().transform_point2(mouse);
+		let snap = &mut self.snap_manager;
+
+		let neighbors = relative.filter(|_| neighbor).map_or(Vec::new(), |neighbor| vec![neighbor]);
+
+		if let Some(relative) = relative.map(|layer| transform.transform_point2(layer)).filter(|_| snap_angle || lock_angle) {
+			let resolution = LINE_ROTATE_SNAP_ANGLE.to_radians();
+
+			let angle = if lock_angle {
+				self.angle
+			} else if (relative - document_pos) != DVec2::ZERO && !lock_angle {
+				(-(relative - document_pos).angle_between(DVec2::X) / resolution).round() * resolution
+			} else {
+				self.angle
+			};
+			document_pos = relative - (relative - document_pos).project_onto(DVec2::new(angle.cos(), angle.sin()));
+
+			let constraint = SnapConstraint::Line {
+				origin: relative,
+				direction: document_pos - relative,
+			};
+			let near_point = SnapCandidatePoint::handle_neighbors(document_pos, neighbors.clone());
+			let far_point = SnapCandidatePoint::handle_neighbors(2. * relative - document_pos, neighbors);
+			if colinear {
+				let snapped = snap.constrained_snap(&snap_data, &near_point, constraint, None);
+				let snapped_far = snap.constrained_snap(&snap_data, &far_point, constraint, None);
+				document_pos = if snapped_far.other_snap_better(&snapped) {
+					snapped.snapped_point_document
+				} else {
+					2. * relative - snapped_far.snapped_point_document
+				};
+				snap.update_indicator(if snapped_far.other_snap_better(&snapped) { snapped } else { snapped_far });
+			} else {
+				let snapped = snap.constrained_snap(&snap_data, &near_point, constraint, None);
+				document_pos = snapped.snapped_point_document;
+				snap.update_indicator(snapped);
+			}
+		} else if let Some(relative) = relative.map(|layer| transform.transform_point2(layer)).filter(|_| colinear) {
+			let snapped = snap.free_snap(&snap_data, &SnapCandidatePoint::handle_neighbors(document_pos, neighbors.clone()), None, false);
+			let snapped_far = snap.free_snap(&snap_data, &SnapCandidatePoint::handle_neighbors(2. * relative - document_pos, neighbors), None, false);
+			document_pos = if snapped_far.other_snap_better(&snapped) {
+				snapped.snapped_point_document
+			} else {
+				2. * relative - snapped_far.snapped_point_document
+			};
+			snap.update_indicator(if snapped_far.other_snap_better(&snapped) { snapped } else { snapped_far });
+		} else {
+			let snapped = snap.free_snap(&snap_data, &SnapCandidatePoint::handle_neighbors(document_pos, neighbors), None, false);
+			document_pos = snapped.snapped_point_document;
+			snap.update_indicator(snapped);
+		}
+
+		if let Some(relative) = relative.map(|layer| transform.transform_point2(layer)) {
+			if (relative - document_pos) != DVec2::ZERO {
+				self.angle = -(relative - document_pos).angle_between(DVec2::X)
+			} else {
+				self.angle = 0.0;
+			}
+		}
+
+		transform.inverse().transform_point2(document_pos)
+	}
+
+	fn finish_transaction(&mut self, fsm: PenToolFsmState, document: &DocumentMessageHandler, responses: &mut VecDeque<Message>) -> Option<DocumentMessage> {
+		// Get subpath
+		let subpath = &get_subpaths(self.layer?, &document.network)?[self.subpath_index];
+
+		// Abort if only one manipulator group has been placed
+		if fsm == PenToolFsmState::PlacingAnchor && subpath.len() < 3 {
+			return None;
+		}
+
+		// Get the last manipulator group and the one previous to that
+		let mut manipulator_groups = subpath.manipulator_groups().iter();
+		let mut last_manipulator_group = if self.from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
+		let previous_manipulator_group = if self.from_start { manipulator_groups.next() } else { manipulator_groups.next_back() };
+
+		// Get correct handle types
+		let outwards_handle = if self.from_start { SelectedType::InHandle } else { SelectedType::OutHandle };
+
+		// If placing anchor we should abort if there are less than three manipulators (as the last one gets deleted)
+		let Some(previous_manipulator_group) = previous_manipulator_group else {
+			return Some(DocumentMessage::AbortTransaction);
+		};
+
+		// Clean up if there are two or more manipulators
+		// Remove the unplaced anchor if in anchor placing mode
+		if fsm == PenToolFsmState::PlacingAnchor {
+			responses.add(GraphOperationMessage::Vector {
+				layer: self.layer?,
+				modification: VectorDataModification::RemoveManipulatorGroup { id: last_manipulator_group.id },
+			});
+			last_manipulator_group = previous_manipulator_group;
+		}
+
+		// Remove the out handle
+		let point = ManipulatorPointId::new(last_manipulator_group.id, outwards_handle);
+		let position = last_manipulator_group.anchor;
+		responses.add(GraphOperationMessage::Vector {
+			layer: self.layer?,
+			modification: VectorDataModification::SetManipulatorPosition { point, position },
+		});
+
+		Some(DocumentMessage::CommitTransaction)
+	}
 }
 
 impl Fsm for PenToolFsmState {
 	type ToolData = PenToolData;
 	type ToolOptions = PenOptions;
 
-	fn transition(
-		self,
-		event: ToolMessage,
-		tool_data: &mut Self::ToolData,
-		(document, _document_id, global_tool_data, input, font_cache): ToolActionHandlerData,
-		tool_options: &Self::ToolOptions,
-		responses: &mut VecDeque<Message>,
-	) -> Self {
-		let transform = tool_data.path.as_ref().and_then(|path| document.graphene_document.multiply_transforms(path).ok()).unwrap_or_default();
+	fn transition(self, event: ToolMessage, tool_data: &mut Self::ToolData, tool_action_data: &mut ToolActionHandlerData, tool_options: &Self::ToolOptions, responses: &mut VecDeque<Message>) -> Self {
+		let ToolActionHandlerData {
+			document,
+			global_tool_data,
+			input,
+			shape_editor,
+			..
+		} = tool_action_data;
 
-		if let ToolMessage::Pen(event) = event {
-			match (self, event) {
-				(_, PenToolMessage::DocumentIsDirty) => {
-					// When the document has moved / needs to be redraw, re-render the overlays
-					// TODO the overlay system should probably receive this message instead of the tool
-					for layer_path in document.selected_visible_layers() {
-						tool_data.overlay_renderer.render_subpath_overlays(&document.graphene_document, layer_path.to_vec(), responses);
-					}
-					self
-				}
-				(_, PenToolMessage::SelectionChanged) => {
-					// Set the previously selected layers to invisible
-					for layer_path in document.all_layers() {
-						tool_data.overlay_renderer.layer_overlay_visibility(&document.graphene_document, layer_path.to_vec(), false, responses);
-					}
-					self
-				}
-				(PenToolFsmState::Ready, PenToolMessage::DragStart) => {
-					responses.push_back(DocumentMessage::StartTransaction.into());
+		let mut transform = tool_data.layer.map(|layer| document.metadata().transform_to_document(layer)).unwrap_or_default();
 
-					// Initialize snapping
-					tool_data.snap_manager.start_snap(document, document.bounding_boxes(None, None, font_cache), true, true);
-					tool_data.snap_manager.add_all_document_handles(document, &[], &[], &[]);
+		if !transform.inverse().is_finite() {
+			let parent_transform = tool_data
+				.layer
+				.and_then(|layer| layer.parent(document.metadata()))
+				.map(|layer| document.metadata().transform_to_document(layer));
 
-					// Disable this tool's mirroring
-					tool_data.should_mirror = false;
+			transform = parent_transform.unwrap_or(DAffine2::IDENTITY);
+		}
 
-					// Perform extension of an existing path
-					if let Some((layer, from_start)) = should_extend(document, input.mouse.position, crate::consts::SNAP_POINT_TOLERANCE) {
-						tool_data.path = Some(layer.to_vec());
-						tool_data.from_start = from_start;
+		if !transform.inverse().is_finite() {
+			transform = DAffine2::IDENTITY;
+		}
 
-						// Stop the handles on the first point from mirroring
-						let mut stop_mirror = || {
-							let subpath = document.graphene_document.layer(layer).ok().and_then(|layer| layer.as_subpath())?;
-							let mut manipulator_groups = subpath.manipulator_groups().enumerate();
-							let (&id, _) = if from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
-
-							let op = Operation::SetManipulatorHandleMirroring {
-								layer_path: layer.to_vec(),
-								id,
-								mirror_distance: false,
-								mirror_angle: false,
-							};
-							responses.push_back(op.into());
-							Some(())
-						};
-						stop_mirror();
-
-						return PenToolFsmState::DraggingHandle;
-					}
-
-					// Deselect layers because we are now creating a new layer
-					responses.push_back(DocumentMessage::DeselectAllLayers.into());
-
-					// Create a new layer
-					tool_data.path = Some(document.get_path_for_new_layer());
-					tool_data.from_start = false;
-
-					// Get the position and set properties
-					let transform = tool_data
-						.path
-						.as_ref()
-						.and_then(|path| document.graphene_document.multiply_transforms(&path[..path.len() - 1]).ok())
-						.unwrap_or_default();
-					let snapped_position = tool_data.snap_manager.snap_position(responses, document, input.mouse.position);
-					let start_position = transform.inverse().transform_point2(snapped_position);
-					tool_data.weight = tool_options.line_weight;
-
-					// Create the initial shape with a `bez_path` (only contains a moveto initially)
-					if let Some(layer_path) = &tool_data.path {
-						responses.push_back(
-							Operation::AddShape {
-								path: layer_path.clone(),
-								transform: DAffine2::IDENTITY.to_cols_array(),
-								insert_index: -1,
-								subpath: Default::default(),
-								style: style::PathStyle::new(Some(style::Stroke::new(global_tool_data.primary_color, tool_data.weight)), style::Fill::None),
-							}
-							.into(),
-						);
-						responses.push_back(add_manipulator_group(
-							&tool_data.path,
-							tool_data.from_start,
-							ManipulatorGroup::new_with_handles(start_position, Some(start_position), Some(start_position)),
-						));
-					}
-
-					// Enter the dragging handle state while the mouse is held down, allowing the user to move the mouse and position the handle
-					PenToolFsmState::DraggingHandle
-				}
-				(PenToolFsmState::PlacingAnchor, PenToolMessage::DragStart) => {
-					// If you place the anchor on top of the previous anchor then you break the mirror
-					let mut check_break = || {
-						// Get subpath
-						let layer_path = tool_data.path.as_ref()?;
-						let subpath = document.graphene_document.layer(layer_path).ok().and_then(|layer| layer.as_subpath())?;
-
-						// Get the last manipulator group and the one previous to that
-						let mut manipulator_groups = subpath.manipulator_groups().enumerate();
-						let (&last_id, last_manipulator_group) = if tool_data.from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
-						let previous = if tool_data.from_start { manipulator_groups.next() } else { manipulator_groups.next_back() };
-
-						// Get correct handle types
-						let outwards_handle = if tool_data.from_start { ManipulatorType::InHandle } else { ManipulatorType::OutHandle };
-
-						// Get manipulator points
-						let last_anchor = last_manipulator_group.points[ManipulatorType::Anchor].as_ref()?;
-
-						if let Some((previous_id, previous_anchor)) = previous
-							.as_ref()
-							.and_then(|(&id, manipulator_group)| manipulator_group.points[ManipulatorType::Anchor].as_ref().map(|x| (id, x)))
-						{
-							// Break the control
-							if transform.transform_point2(last_anchor.position).distance_squared(transform.transform_point2(previous_anchor.position)) < crate::consts::SNAP_POINT_TOLERANCE.powi(2) {
-								// Remove the point that has just been placed
-								let op = Operation::RemoveManipulatorGroup {
-									layer_path: layer_path.clone(),
-									id: last_id,
-								};
-								responses.push_back(op.into());
-
-								// Move the in handle of the previous anchor to on top of the previous position
-								let op = Operation::MoveManipulatorPoint {
-									layer_path: layer_path.clone(),
-									id: previous_id,
-									manipulator_type: outwards_handle,
-									position: previous_anchor.position.into(),
-								};
-								responses.push_back(op.into());
-
-								// Stop the handles on the last point from mirroring
-								let op = Operation::SetManipulatorHandleMirroring {
-									layer_path: layer_path.clone(),
-									id: previous_id,
-									mirror_distance: false,
-									mirror_angle: false,
-								};
-								responses.push_back(op.into());
-
-								// The overlay system cannot detect deleted points so we must just delete all the overlays
-								for layer_path in document.all_layers() {
-									tool_data.overlay_renderer.clear_subpath_overlays(&document.graphene_document, layer_path.to_vec(), responses);
-								}
-
-								tool_data.should_mirror = false;
-							}
-						}
-						None
-					};
-					check_break().unwrap_or(PenToolFsmState::DraggingHandle)
-				}
-				(PenToolFsmState::DraggingHandle, PenToolMessage::DragStop) => {
-					let mut process = || {
-						// Get subpath
-						let layer_path = tool_data.path.as_ref()?;
-						let subpath = document.graphene_document.layer(layer_path).ok().and_then(|layer| layer.as_subpath())?;
-
-						// Get the last manipulator group and the one previous to that
-						let mut manipulator_groups = subpath.manipulator_groups().enumerate();
-						let (&last_id, last_manipulator_group) = if tool_data.from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
-						let previous = if tool_data.from_start { manipulator_groups.next() } else { manipulator_groups.next_back() };
-
-						// Get the first manipulator group
-						let mut manipulator_groups = subpath.manipulator_groups().enumerate();
-						let (&first_id, first_manipulator_group) = if tool_data.from_start { manipulator_groups.next_back()? } else { manipulator_groups.next()? };
-
-						// Get correct handle types
-						let inwards_handle = if tool_data.from_start { ManipulatorType::OutHandle } else { ManipulatorType::InHandle };
-						let outwards_handle = if tool_data.from_start { ManipulatorType::InHandle } else { ManipulatorType::OutHandle };
-
-						// Get manipulator points
-						let last_anchor = last_manipulator_group.points[ManipulatorType::Anchor].as_ref()?;
-						let first_anchor = first_manipulator_group.points[ManipulatorType::Anchor].as_ref()?;
-						let last_in = last_manipulator_group.points[inwards_handle].as_ref()?;
-
-						// Close path
-						let transformed_distance_between_squared = transform.transform_point2(last_anchor.position).distance_squared(transform.transform_point2(first_anchor.position));
-						let snap_point_tolerance_squared = crate::consts::SNAP_POINT_TOLERANCE.powi(2);
-						if transformed_distance_between_squared < snap_point_tolerance_squared && previous.is_some() {
-							// Move the in handle of the first point to where the user has placed it
-							let op = Operation::MoveManipulatorPoint {
-								layer_path: layer_path.clone(),
-								id: first_id,
-								manipulator_type: inwards_handle,
-								position: last_in.position.into(),
-							};
-							responses.push_back(op.into());
-
-							// Stop the handles on the first point from mirroring
-							let op = Operation::SetManipulatorHandleMirroring {
-								layer_path: layer_path.clone(),
-								id: first_id,
-								mirror_distance: false,
-								mirror_angle: false,
-							};
-							responses.push_back(op.into());
-
-							// Remove the point that has just been placed
-							let op = Operation::RemoveManipulatorGroup {
-								layer_path: layer_path.clone(),
-								id: last_id,
-							};
-							responses.push_back(op.into());
-
-							// Push a close path node
-							responses.push_back(add_manipulator_group(&tool_data.path, false, ManipulatorGroup::closed()));
-
-							responses.push_back(DocumentMessage::CommitTransaction.into());
-
-							// Clean up overlays
-							for layer_path in document.all_layers() {
-								tool_data.overlay_renderer.clear_subpath_overlays(&document.graphene_document, layer_path.to_vec(), responses);
-							}
-
-							// Clean up tool data
-							tool_data.path = None;
-							tool_data.snap_manager.cleanup(responses);
-
-							// Return the new tool state, wrapped in `Some()` because this closure returns an Option used by the `?` operation various times above
-							return Some(PenToolFsmState::Ready);
-						}
-						// Add a new manipulator for the next anchor that we will place
-						if let Some(out_handle) = &last_manipulator_group.points[outwards_handle] {
-							responses.push_back(add_manipulator_group(&tool_data.path, tool_data.from_start, ManipulatorGroup::new_with_anchor(out_handle.position)));
-						}
-
-						// Returning `None` means the `unwrap_or` clause below returns the state `PlacingAnchor`
-						None
-					};
-					tool_data.should_mirror = true;
-					process().unwrap_or(PenToolFsmState::PlacingAnchor)
-				}
-				(PenToolFsmState::DraggingHandle, PenToolMessage::PointerMove { snap_angle, break_handle }) => {
-					let mut process = || {
-						// Get subpath
-						let layer_path = tool_data.path.as_ref()?;
-						let subpath = document.graphene_document.layer(layer_path).ok().and_then(|layer| layer.as_subpath())?;
-
-						// Get the last manipulator group
-						let mut manipulator_groups = subpath.manipulator_groups().enumerate();
-						let (&last_id, last_manipulator_group) = if tool_data.from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
-
-						// Get correct handle types
-						let inwards_handle = if tool_data.from_start { ManipulatorType::OutHandle } else { ManipulatorType::InHandle };
-						let outwards_handle = if tool_data.from_start { ManipulatorType::InHandle } else { ManipulatorType::OutHandle };
-
-						// Get manipulator points
-						let last_anchor = last_manipulator_group.points[ManipulatorType::Anchor].as_ref()?;
-
-						let mouse = tool_data.snap_manager.snap_position(responses, document, input.mouse.position);
-						let pos = transform.inverse().transform_point2(mouse);
-						let pos = compute_snapped_angle(input, snap_angle, pos, last_anchor.position);
-
-						// Update points on current segment (to show preview of new handle)
-						let msg = Operation::MoveManipulatorPoint {
-							layer_path: layer_path.clone(),
-							id: last_id,
-							manipulator_type: outwards_handle,
-							position: pos.into(),
-						};
-						responses.push_back(msg.into());
-
-						let should_mirror = !input.keyboard.get(break_handle as usize) && tool_data.should_mirror;
-						// Mirror handle of last segment
-						if should_mirror {
-							// Could also be written as `last_anchor.position * 2 - pos` but this way avoids overflow/underflow better
-							let pos = last_anchor.position - (pos - last_anchor.position);
-
-							let msg = Operation::MoveManipulatorPoint {
-								layer_path: layer_path.clone(),
-								id: last_id,
-								manipulator_type: inwards_handle,
-								position: pos.into(),
-							};
-							responses.push_back(msg.into());
-						}
-
-						// Update the mirror status of the currently modifying point
-						let op = Operation::SetManipulatorHandleMirroring {
-							layer_path: layer_path.clone(),
-							id: last_id,
-							mirror_distance: should_mirror,
-							mirror_angle: should_mirror,
-						};
-						responses.push_back(op.into());
-
-						Some(())
-					};
-					if process().is_none() {
-						PenToolFsmState::Ready
-					} else {
-						self
-					}
-				}
-				(PenToolFsmState::PlacingAnchor, PenToolMessage::PointerMove { snap_angle, .. }) => {
-					let mut process = || {
-						// Get subpath
-						let layer_path = tool_data.path.as_ref()?;
-						let subpath = document.graphene_document.layer(layer_path).ok().and_then(|layer| layer.as_subpath())?;
-
-						// Get the last manipulator group and the one previous to that
-						let mut manipulator_groups = subpath.manipulator_groups().enumerate();
-						let (&last_id, _last_manipulator_group) = if tool_data.from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
-						let previous = if tool_data.from_start { manipulator_groups.next() } else { manipulator_groups.next_back() };
-
-						// Get the first manipulator group
-						let mut manipulator_groups = subpath.manipulator_groups().enumerate();
-						let (_first_id, first_manipulator_group) = if tool_data.from_start { manipulator_groups.next_back()? } else { manipulator_groups.next()? };
-
-						// Get manipulator points
-						let first_anchor = first_manipulator_group.points[ManipulatorType::Anchor].as_ref()?;
-
-						let mouse = tool_data.snap_manager.snap_position(responses, document, input.mouse.position);
-						let mut pos = transform.inverse().transform_point2(mouse);
-
-						// Snap to the first point (to show close path)
-						if mouse.distance_squared(transform.transform_point2(first_anchor.position)) < crate::consts::SNAP_POINT_TOLERANCE.powi(2) {
-							pos = first_anchor.position;
-						}
-
-						if let Some(relative) = previous.as_ref().and_then(|(_, manipulator_group)| manipulator_group.points[ManipulatorType::Anchor].as_ref()) {
-							// Snap to the previously placed point (to show break control)
-							if mouse.distance_squared(transform.transform_point2(relative.position)) < crate::consts::SNAP_POINT_TOLERANCE.powi(2) {
-								pos = relative.position;
-							} else {
-								pos = compute_snapped_angle(input, snap_angle, pos, relative.position);
-							}
-						}
-
-						for manipulator_type in [ManipulatorType::Anchor, ManipulatorType::InHandle, ManipulatorType::OutHandle] {
-							let msg = Operation::MoveManipulatorPoint {
-								layer_path: layer_path.clone(),
-								id: last_id,
-								manipulator_type,
-								position: pos.into(),
-							};
-							responses.push_back(msg.into());
-						}
-
-						Some(())
-					};
-					if process().is_none() {
-						PenToolFsmState::Ready
-					} else {
-						self
-					}
-				}
-				(PenToolFsmState::DraggingHandle | PenToolFsmState::PlacingAnchor, PenToolMessage::Abort | PenToolMessage::Confirm) => {
-					// Abort or commit the transaction to the undo history
-					let mut commit = || {
-						// Get subpath
-						let layer_path = tool_data.path.as_ref()?;
-						let subpath = document.graphene_document.layer(layer_path).ok().and_then(|layer| layer.as_subpath())?;
-
-						// If placing anchor we should abort if there are less than three manipulators (as the last one gets deleted)
-						if self == PenToolFsmState::PlacingAnchor && subpath.manipulator_groups().len() < 3 {
-							return None;
-						}
-
-						// Get the last manipulator group and the one previous to that
-						let mut manipulator_groups = subpath.manipulator_groups().enumerate();
-						let (&(mut last_id), mut last_manipulator_group) = if tool_data.from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
-						let previous = if tool_data.from_start { manipulator_groups.next() } else { manipulator_groups.next_back() };
-
-						// Get correct handle types
-						let outwards_handle = if tool_data.from_start { ManipulatorType::InHandle } else { ManipulatorType::OutHandle };
-
-						// Clean up if there are two or more manipulators
-						if let Some((&previous_id, previous_manipulator_group)) = previous {
-							// Remove the unplaced anchor if in anchor placing mode
-							if self == PenToolFsmState::PlacingAnchor {
-								let layer_path = layer_path.clone();
-								let op = Operation::RemoveManipulatorGroup { layer_path, id: last_id };
-								responses.push_back(op.into());
-								last_id = previous_id;
-								last_manipulator_group = previous_manipulator_group;
-							}
-
-							// Remove the out handle
-							let op = Operation::MoveManipulatorPoint {
-								layer_path: layer_path.clone(),
-								id: last_id,
-								manipulator_type: outwards_handle,
-								position: last_manipulator_group.points[ManipulatorType::Anchor].as_ref()?.position.into(),
-							};
-							responses.push_back(op.into());
-
-							responses.push_back(DocumentMessage::CommitTransaction.into());
-
-							return Some(());
-						}
-
-						// Abort if only one manipulator group has been placed
-						None
-					};
-					if commit().is_none() {
-						responses.push_back(DocumentMessage::AbortTransaction.into());
-					}
-
-					// Clean up overlays
-					for layer_path in document.all_layers() {
-						tool_data.overlay_renderer.clear_subpath_overlays(&document.graphene_document, layer_path.to_vec(), responses);
-					}
-					tool_data.path = None;
-					tool_data.snap_manager.cleanup(responses);
-
-					PenToolFsmState::Ready
-				}
-				(_, PenToolMessage::Abort) => {
-					// Clean up overlays
-					for layer_path in document.all_layers() {
-						tool_data.overlay_renderer.clear_subpath_overlays(&document.graphene_document, layer_path.to_vec(), responses);
-					}
-					self
-				}
-				_ => self,
+		let ToolMessage::Pen(event) = event else {
+			return self;
+		};
+		match (self, event) {
+			(_, PenToolMessage::SelectionChanged) => {
+				responses.add(OverlaysMessage::Draw);
+				self
 			}
-		} else {
-			self
+			(_, PenToolMessage::Overlays(mut overlay_context)) => {
+				path_overlays(document, shape_editor, &mut overlay_context);
+				tool_data.snap_manager.draw_overlays(SnapData::new(document, input), &mut overlay_context);
+
+				self
+			}
+			(_, PenToolMessage::WorkingColorChanged) => {
+				responses.add(PenToolMessage::UpdateOptions(PenOptionsUpdate::WorkingColors(
+					Some(global_tool_data.primary_color),
+					Some(global_tool_data.secondary_color),
+				)));
+				self
+			}
+			(PenToolFsmState::Ready, PenToolMessage::DragStart) => {
+				responses.add(DocumentMessage::StartTransaction);
+
+				// Prevent the initial point from having a colinear in handle while dragging the out handle
+				tool_data.colinear_handles = false;
+
+				// Perform extension of an existing path
+				if let Some((layer, subpath_index, from_start)) = should_extend(document, input.mouse.position, crate::consts::SNAP_POINT_TOLERANCE) {
+					tool_data.extend_subpath(layer, subpath_index, from_start, document, responses);
+				} else {
+					tool_data.create_new_path(
+						document,
+						tool_options.line_weight,
+						tool_options.stroke.active_color(),
+						tool_options.fill.active_color(),
+						input,
+						responses,
+					);
+				}
+
+				// Enter the dragging handle state while the mouse is held down, allowing the user to move the mouse and position the handle
+				PenToolFsmState::DraggingHandle
+			}
+			(PenToolFsmState::PlacingAnchor, PenToolMessage::DragStart) => {
+				responses.add(DocumentMessage::StartTransaction);
+				tool_data.bend_from_previous_point(document, transform, responses);
+				PenToolFsmState::DraggingHandle
+			}
+			(PenToolFsmState::DraggingHandle, PenToolMessage::DragStop) => {
+				tool_data.colinear_handles = true;
+				tool_data.finish_placing_handle(document, transform, responses).unwrap_or(PenToolFsmState::PlacingAnchor)
+			}
+			(PenToolFsmState::DraggingHandle, PenToolMessage::PointerMove { snap_angle, break_handle, lock_angle }) => {
+				let modifiers = ModifierState {
+					snap_angle: input.keyboard.key(snap_angle),
+					lock_angle: input.keyboard.key(lock_angle),
+					break_handle: input.keyboard.key(break_handle),
+				};
+				let snap_data = SnapData::new(document, input);
+
+				let state = tool_data
+					.drag_handle(snap_data, transform, input.mouse.position, modifiers, responses)
+					.unwrap_or(PenToolFsmState::Ready);
+
+				// Auto-panning
+				let messages = [
+					PenToolMessage::PointerOutsideViewport { snap_angle, break_handle, lock_angle }.into(),
+					PenToolMessage::PointerMove { snap_angle, break_handle, lock_angle }.into(),
+				];
+				tool_data.auto_panning.setup_by_mouse_position(input, &messages, responses);
+
+				state
+			}
+			(PenToolFsmState::PlacingAnchor, PenToolMessage::PointerMove { snap_angle, break_handle, lock_angle }) => {
+				let modifiers = ModifierState {
+					snap_angle: input.keyboard.key(snap_angle),
+					lock_angle: input.keyboard.key(lock_angle),
+					break_handle: input.keyboard.key(break_handle),
+				};
+				let state = tool_data
+					.place_anchor(SnapData::new(document, input), transform, input.mouse.position, modifiers, responses)
+					.unwrap_or(PenToolFsmState::Ready);
+
+				// Auto-panning
+				let messages = [
+					PenToolMessage::PointerOutsideViewport { snap_angle, break_handle, lock_angle }.into(),
+					PenToolMessage::PointerMove { snap_angle, break_handle, lock_angle }.into(),
+				];
+				tool_data.auto_panning.setup_by_mouse_position(input, &messages, responses);
+
+				state
+			}
+			(PenToolFsmState::Ready, PenToolMessage::PointerMove { .. }) => {
+				tool_data.snap_manager.preview_draw(&SnapData::new(document, input), input.mouse.position);
+				responses.add(OverlaysMessage::Draw);
+				self
+			}
+			(PenToolFsmState::DraggingHandle, PenToolMessage::PointerOutsideViewport { .. }) => {
+				// Auto-panning
+				let _ = tool_data.auto_panning.shift_viewport(input, responses);
+
+				PenToolFsmState::DraggingHandle
+			}
+			(PenToolFsmState::PlacingAnchor, PenToolMessage::PointerOutsideViewport { .. }) => {
+				// Auto-panning
+				let _ = tool_data.auto_panning.shift_viewport(input, responses);
+
+				PenToolFsmState::PlacingAnchor
+			}
+			(state, PenToolMessage::PointerOutsideViewport { snap_angle, break_handle, lock_angle }) => {
+				// Auto-panning
+				let messages = [
+					PenToolMessage::PointerOutsideViewport { snap_angle, break_handle, lock_angle }.into(),
+					PenToolMessage::PointerMove { snap_angle, break_handle, lock_angle }.into(),
+				];
+				tool_data.auto_panning.stop(&messages, responses);
+
+				state
+			}
+			(PenToolFsmState::DraggingHandle | PenToolFsmState::PlacingAnchor, PenToolMessage::Abort | PenToolMessage::Confirm) => {
+				// Abort or commit the transaction to the undo history
+				let message = tool_data.finish_transaction(self, document, responses).unwrap_or(DocumentMessage::AbortTransaction);
+				responses.add(message);
+
+				tool_data.layer = None;
+				tool_data.snap_manager.cleanup(responses);
+
+				PenToolFsmState::Ready
+			}
+			(_, PenToolMessage::Abort) => {
+				responses.add(OverlaysMessage::Draw);
+
+				self
+			}
+			(PenToolFsmState::DraggingHandle | PenToolFsmState::PlacingAnchor, PenToolMessage::Undo) => tool_data
+				.place_anchor(SnapData::new(document, input), transform, input.mouse.position, ModifierState::default(), responses)
+				.unwrap_or(PenToolFsmState::PlacingAnchor),
+			(_, PenToolMessage::Redo) => tool_data
+				.place_anchor(SnapData::new(document, input), transform, input.mouse.position, ModifierState::default(), responses)
+				.unwrap_or(PenToolFsmState::PlacingAnchor),
+			_ => self,
 		}
 	}
 
 	fn update_hints(&self, responses: &mut VecDeque<Message>) {
 		let hint_data = match self {
-			PenToolFsmState::Ready => HintData(vec![HintGroup(vec![HintInfo {
-				key_groups: vec![],
-				key_groups_mac: None,
-				mouse: Some(MouseMotion::Lmb),
-				label: String::from("Draw Path"),
-				plus: false,
-			}])]),
-			PenToolFsmState::DraggingHandle | PenToolFsmState::PlacingAnchor => HintData(vec![
-				HintGroup(vec![HintInfo {
-					key_groups: vec![],
-					key_groups_mac: None,
-					mouse: Some(MouseMotion::LmbDrag),
-					label: String::from("Add Handle"),
-					plus: false,
-				}]),
-				HintGroup(vec![HintInfo {
-					key_groups: vec![],
-					key_groups_mac: None,
-					mouse: Some(MouseMotion::Lmb),
-					label: String::from("Add Anchor"),
-					plus: false,
-				}]),
-				HintGroup(vec![HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Control])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("Snap 15°"),
-					plus: false,
-				}]),
-				HintGroup(vec![HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Shift])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("Break Handle"),
-					plus: false,
-				}]),
-				HintGroup(vec![HintInfo {
-					key_groups: vec![KeysGroup(vec![Key::Enter])],
-					key_groups_mac: None,
-					mouse: None,
-					label: String::from("End Path"),
-					plus: false,
-				}]),
+			PenToolFsmState::Ready => HintData(vec![HintGroup(vec![HintInfo::mouse(MouseMotion::Lmb, "Draw Path")])]),
+			PenToolFsmState::PlacingAnchor => HintData(vec![
+				HintGroup(vec![
+					HintInfo::mouse(MouseMotion::Rmb, ""),
+					HintInfo::keys([Key::Escape], "").prepend_slash(),
+					HintInfo::keys([Key::Enter], "End Path").prepend_slash(),
+				]),
+				HintGroup(vec![HintInfo::keys([Key::Shift], "Snap 15°"), HintInfo::keys([Key::Control], "Lock Angle")]),
+				HintGroup(vec![HintInfo::mouse(MouseMotion::Lmb, "Add Sharp Point"), HintInfo::mouse(MouseMotion::LmbDrag, "Add Smooth Point")]),
+				HintGroup(vec![
+					HintInfo::mouse(MouseMotion::Lmb, ""),
+					HintInfo::mouse(MouseMotion::LmbDrag, "Bend from Prev. Point").prepend_slash(),
+				]),
+			]),
+			PenToolFsmState::DraggingHandle => HintData(vec![
+				HintGroup(vec![
+					HintInfo::mouse(MouseMotion::Rmb, ""),
+					HintInfo::keys([Key::Escape], "").prepend_slash(),
+					HintInfo::keys([Key::Enter], "End Path").prepend_slash(),
+				]),
+				HintGroup(vec![HintInfo::keys([Key::Shift], "Snap 15°"), HintInfo::keys([Key::Control], "Lock Angle")]),
+				// TODO: Only show this if the handle being dragged is colinear, so don't show this when bending from the previous point (by clicking and dragging from the previously placed anchor)
+				HintGroup(vec![HintInfo::keys([Key::Alt], "Bend Handle")]),
 			]),
 		};
 
-		responses.push_back(FrontendMessage::UpdateInputHints { hint_data }.into());
+		responses.add(FrontendMessage::UpdateInputHints { hint_data });
 	}
 
 	fn update_cursor(&self, responses: &mut VecDeque<Message>) {
-		responses.push_back(FrontendMessage::UpdateMouseCursor { cursor: MouseCursorIcon::Default }.into());
+		responses.add(FrontendMessage::UpdateMouseCursor { cursor: MouseCursorIcon::Default });
 	}
 }
 
-// TODO: Expand `pos` name below to the full word (position?)
-/// Snap the angle of the line from relative to pos if the key is pressed.
-fn compute_snapped_angle(input: &InputPreprocessorMessageHandler, key: Key, pos: DVec2, relative: DVec2) -> DVec2 {
-	if input.keyboard.get(key as usize) {
-		let delta = relative - pos;
-
-		let length = delta.length();
-		let mut angle = -delta.angle_between(DVec2::X);
-
-		let snap_resolution = LINE_ROTATE_SNAP_ANGLE.to_radians();
-		angle = (angle / snap_resolution).round() * snap_resolution;
-
-		let rotated = DVec2::new(length * angle.cos(), length * angle.sin());
-		relative - rotated
+/// Pushes a [ManipulatorGroup] to the current layer via a [GraphOperationMessage].
+fn add_manipulator_group(layer: Option<LayerNodeIdentifier>, from_start: bool, manipulator_group: bezier_rs::ManipulatorGroup<ManipulatorGroupId>) -> Message {
+	let Some(layer) = layer else {
+		return Message::NoOp;
+	};
+	let modification = if from_start {
+		VectorDataModification::AddStartManipulatorGroup { subpath_index: 0, manipulator_group }
 	} else {
-		pos
-	}
-}
-
-/// Pushes a [ManipulatorGroup] to the current layer via an [Operation].
-fn add_manipulator_group(layer_path: &Option<Vec<LayerId>>, from_start: bool, manipulator_group: ManipulatorGroup) -> Message {
-	match (layer_path, from_start) {
-		(Some(layer_path), true) => Operation::PushFrontManipulatorGroup {
-			layer_path: layer_path.clone(),
-			manipulator_group,
-		}
-		.into(),
-		(Some(layer_path), false) => Operation::PushManipulatorGroup {
-			layer_path: layer_path.clone(),
-			manipulator_group,
-		}
-		.into(),
-		(None, _) => Message::NoOp,
-	}
-}
-
-/// Determines if a path should be extended. Returns the path and if it is extending from the start, if applicable.
-fn should_extend(document: &DocumentMessageHandler, pos: DVec2, tolerance: f64) -> Option<(&[LayerId], bool)> {
-	let mut best = None;
-	let mut best_distance_squared = tolerance * tolerance;
-
-	for layer_path in document.selected_layers() {
-		(|| {
-			let viewspace = document.graphene_document.generate_transform_relative_to_viewport(layer_path).ok()?;
-
-			let subpath = document.graphene_document.layer(layer_path).ok().and_then(|layer| layer.as_subpath())?;
-			let (_first_id, first) = subpath.manipulator_groups().enumerate().next()?;
-			let (_last_id, last) = subpath.manipulator_groups().enumerate().next_back()?;
-
-			if !last.is_close() {
-				for (manipulator_group, from_start) in [(first, true), (last, false)] {
-					if let Some(point) = &manipulator_group.points[ManipulatorType::Anchor] {
-						let distance_squared = viewspace.transform_point2(point.position).distance_squared(pos);
-
-						if distance_squared < best_distance_squared {
-							best = Some((layer_path, from_start));
-							best_distance_squared = distance_squared;
-						}
-					}
-				}
-			}
-
-			None::<()>
-		})();
-	}
-
-	best
+		VectorDataModification::AddEndManipulatorGroup { subpath_index: 0, manipulator_group }
+	};
+	GraphOperationMessage::Vector { layer, modification }.into()
 }
